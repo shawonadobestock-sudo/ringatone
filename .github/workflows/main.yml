@@ -329,14 +329,16 @@ jobs:
                   }
                 }
               });
-              // Also sniff responses for token in JSON body
-              page.on('response', async res => {
+              // Also sniff /oauth/token response (PKCE code exchange) — this is the key one!
+              page.on('response', async resp => {
                 try {
-                  if (res.url().includes('auth0') || res.url().includes('stableaudio.com/login')) {
-                    const json = await res.json().catch(() => null);
+                  const url = resp.url();
+                  const isTokenEndpoint = url.includes('/oauth/token') || url.includes('/token') || url.includes('auth0') || url.includes('login.stableaudio');
+                  if (isTokenEndpoint && resp.status() === 200) {
+                    const json = await resp.json().catch(() => null);
                     if (json && (json.access_token || json.id_token)) {
                       capturedToken = json.access_token || json.id_token;
-                      console.log('  🔑 Token captured from auth response body!');
+                      console.log(`  🔑 Token captured from /oauth/token response!`);
                     }
                   }
                 } catch {}
@@ -416,69 +418,70 @@ jobs:
               await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
               await page.click('button[type="submit"]');
 
-              // ── Step 8a: Wait for redirect away from auth0 ───────────────────────
-              console.log('  ⏳ Step 8a: Waiting for redirect away from Auth0...');
-              try {
-                await page.waitForURL(
-                  url => !url.includes('auth0') && !url.includes('login.stableaudio'),
-                  { timeout: 60000 }
-                );
-                console.log(`  ✅ Redirected to: ${page.url()}`);
-              } catch {
-                console.warn(`  ⚠️ Still on: ${page.url()} — continuing anyway`);
+              // ── Step 8: Wait for OAuth code exchange + extract token ──────────────
+              // Auth0 redirects back to stableaudio.com/generate?code=...&state=...
+              // The SPA POSTs to /oauth/token to exchange the code for a Bearer token.
+              // We MUST NOT navigate away during this exchange — stay on callback URL!
+              console.log('  ⏳ Step 8: Waiting for OAuth code exchange + token...');
+
+              // 8a: Wait until we land on stableaudio.com
+              if (!page.url().includes('stableaudio.com')) {
+                try {
+                  await page.waitForURL(url => url.includes('stableaudio.com'), { timeout: 60000 });
+                  console.log(`  ✅ OAuth callback arrived: ${page.url()}`);
+                } catch {
+                  console.warn(`  ⚠️ Timeout waiting for redirect — on: ${page.url()}`);
+                }
+              } else {
+                console.log(`  ✅ Already on stableaudio.com: ${page.url()}`);
+              }
+
+              // 8b: If URL has ?code= the SPA is exchanging it — wait for clean URL
+              if (page.url().includes('code=')) {
+                console.log('  🔄 OAuth code exchange in progress — waiting (do NOT navigate)...');
+                try {
+                  await page.waitForURL(
+                    url => url.includes('stableaudio.com') && !url.includes('code='),
+                    { timeout: 30000 }
+                  );
+                  console.log(`  ✅ Code exchanged! URL: ${page.url()}`);
+                } catch {
+                  console.warn('  ⚠️ Code cleanup timeout — token may already be in localStorage');
+                }
               }
               await sleep(3000);
 
-              // ── Step 8b: Navigate to /generate to force SPA API initialization ─────
-              // The SPA only fires authenticated API requests once it loads the app.
-              // /generate forces the auth module to initialize and emit the Bearer token.
-              console.log('  🎵 Step 8b: Navigating to /generate to force API auth calls...');
-              try {
-                await page.goto('https://stableaudio.com/generate', { waitUntil: 'networkidle', timeout: 30000 });
-              } catch {
-                await page.goto('https://stableaudio.com/generate', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-              }
-              await sleep(4000);
-
-              // ── Step 8c: Multi-strategy token extraction (90s window) ─────────────
-              console.log('  🔍 Step 8c: Extracting token (network sniff + localStorage + fetch intercept)...');
+              // 8c: Poll for token (90s window, 3 strategies)
+              console.log('  🔍 Step 8c: Polling for token...');
               const tokenDeadline = Date.now() + 90000;
               while (!capturedToken && Date.now() < tokenDeadline) {
-
-                // Strategy 1: Deep localStorage scan (all keys, all value shapes)
+                // Strategy 1: Deep localStorage scan
                 const lsToken = await page.evaluate(() => {
                   for (let i = 0; i < localStorage.length; i++) {
                     const key = localStorage.key(i);
                     if (!key) continue;
                     try {
-                      const raw = localStorage.getItem(key);
-                      const parsed = JSON.parse(raw);
-                      // Check nested body.access_token (Auth0 SPA SDK v1)
+                      const parsed = JSON.parse(localStorage.getItem(key));
                       if (parsed?.body?.access_token) return parsed.body.access_token;
-                      // Flat access_token (Auth0 SPA SDK v2)
-                      if (parsed?.access_token) return parsed.access_token;
-                      // idToken fallback
-                      if (parsed?.idToken) return parsed.idToken;
-                      // Nested decodedToken
-                      if (parsed?.decodedToken?.user?.sub && parsed?.body?.access_token) return parsed.body.access_token;
+                      if (parsed?.access_token)       return parsed.access_token;
+                      if (parsed?.idToken)             return parsed.idToken;
                     } catch {}
                   }
                   return null;
                 }).catch(() => null);
                 if (lsToken) { capturedToken = lsToken; break; }
 
-                // Strategy 2: Inject fetch interceptor to sniff Authorization header
+                // Strategy 2: Fetch interceptor (sniff outgoing Authorization headers)
                 const intercepted = await page.evaluate(() => {
                   if (window.__sniffedToken) return window.__sniffedToken;
                   if (!window.__fetchPatched) {
                     window.__fetchPatched = true;
                     const origFetch = window.fetch;
                     window.fetch = function(...args) {
-                      const [url, opts] = args;
+                      const [, opts] = args;
                       const auth = opts?.headers?.Authorization || opts?.headers?.authorization || '';
-                      if (auth.startsWith('Bearer ') && auth.length > 60) {
+                      if (auth.startsWith('Bearer ') && auth.length > 60)
                         window.__sniffedToken = auth.replace('Bearer ', '');
-                      }
                       return origFetch.apply(this, args);
                     };
                   }
@@ -486,15 +489,10 @@ jobs:
                 }).catch(() => null);
                 if (intercepted) { capturedToken = intercepted; break; }
 
-                // Strategy 3: Scroll the generate page to trigger lazy-loaded API calls
-                if ((tokenDeadline - Date.now()) < 60000) {
-                  await page.evaluate(() => window.scrollTo(0, 200)).catch(() => {});
-                }
-
                 await sleep(1500);
               }
 
-              if (!capturedToken) throw new Error('Token not captured within 90s. Stable Audio may require email verification or CAPTCHA.');
+              if (!capturedToken) throw new Error('Token not captured within 90s after OAuth code exchange.');
 
               console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
               console.log(`  📧 ${email}`);
