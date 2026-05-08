@@ -225,29 +225,29 @@ jobs:
             'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
           ];
 
-          // ─── METADATA GENERATION (4 parallel Gemini calls) ────────────────────────
+          // ─── METADATA GENERATION (4 parallel Groq calls) ─────────────────────────
           async function generateMetadataFromPrompt(prompt) {
             console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
 
             const [title, keywords, category, description] = await Promise.all([
-              callGemini(
+              callGroq(
                 `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
                 `Generate a creative, catchy title that is naturally around 30 characters long. ` +
                 `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
                 `Only provide the title itself, no extra text or instructions.`
               ),
-              callGemini(
+              callGroq(
                 `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
                 `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
                 `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
                 `Present keywords in a single comma-separated line without punctuation or full stops.`
               ),
-              callGemini(
+              callGroq(
                 `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
                 `Analyze and select the most appropriate category from this exact list. ` +
                 `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`
               ),
-              callGemini(
+              callGroq(
                 `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
                 `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
                 `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
@@ -271,6 +271,7 @@ jobs:
               description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
             };
           }
+
 
           // ─── CREDENTIAL HELPERS ────────────────────────────────────────────────────
           function generateRandomEmail() {
