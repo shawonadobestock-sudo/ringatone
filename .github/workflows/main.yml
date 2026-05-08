@@ -67,7 +67,8 @@ jobs:
       - name: 📥 Install Dependencies
         run: |
           npm init -y
-          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg
+          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright
+          npx playwright install chromium --with-deps
 
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
@@ -263,8 +264,197 @@ jobs:
             };
           }
 
+          // ─── CREDENTIAL HELPERS ────────────────────────────────────────────────────
+          function generateRandomEmail() {
+            const ts  = Date.now();
+            const rnd = Math.random().toString(36).substring(2, 10);
+            const domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+            const domain  = domains[Math.floor(Math.random() * domains.length)];
+            return `stableaudio_${rnd}_${ts}@${domain}`;
+          }
+
+          function generateStrongPassword() {
+            const lc  = 'abcdefghijklmnopqrstuvwxyz';
+            const uc  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+            const num = '0123456789';
+            const sp  = '!@#$%^&*';
+            let pw = '';
+            pw += lc[Math.floor(Math.random() * lc.length)];
+            pw += lc[Math.floor(Math.random() * lc.length)];
+            pw += uc[Math.floor(Math.random() * uc.length)];
+            pw += uc[Math.floor(Math.random() * uc.length)];
+            pw += num[Math.floor(Math.random() * num.length)];
+            pw += num[Math.floor(Math.random() * num.length)];
+            pw += sp[Math.floor(Math.random() * sp.length)];
+            pw += sp[Math.floor(Math.random() * sp.length)];
+            const all = lc + uc + num + sp;
+            for (let i = 0; i < 4; i++) pw += all[Math.floor(Math.random() * all.length)];
+            return pw.split('').sort(() => Math.random() - 0.5).join('');
+          }
+
+          // ─── AUTO ACCOUNT CREATION (Playwright — mirrors background.js) ───────────
+          // Called automatically when Stable Audio API returns a rate-limit error.
+          // Returns the new Bearer token string, or throws on failure.
+          async function createStableAudioAccount() {
+            const { chromium } = await import('playwright');
+            const email    = generateRandomEmail();
+            const password = generateStrongPassword();
+
+            console.log('\n  🤖 AUTO ACCOUNT CREATION STARTED');
+            console.log(`  📧 Email   : ${email}`);
+            console.log(`  🔑 Password: ${password}`);
+
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
+
+            let capturedToken = null;
+
+            try {
+              const context = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+              });
+              const page = await context.newPage();
+
+              // ── Intercept network to capture Bearer token ──────────────────────────
+              // Stable Audio's SPA sends the access token in Authorization headers.
+              // We sniff it from outgoing requests to their API.
+              page.on('request', req => {
+                const auth = req.headers()['authorization'];
+                if (auth && auth.startsWith('Bearer ') && req.url().includes('stableaudio.com')) {
+                  const tok = auth.replace('Bearer ', '').trim();
+                  if (tok.length > 50) {
+                    capturedToken = tok;
+                    console.log('  🔑 Token captured from network request!');
+                  }
+                }
+              });
+              // Also sniff responses for token in JSON body
+              page.on('response', async res => {
+                try {
+                  if (res.url().includes('auth0') || res.url().includes('stableaudio.com/login')) {
+                    const json = await res.json().catch(() => null);
+                    if (json && (json.access_token || json.id_token)) {
+                      capturedToken = json.access_token || json.id_token;
+                      console.log('  🔑 Token captured from auth response body!');
+                    }
+                  }
+                } catch {}
+              });
+
+              // ── Step 1: Hit Auth0 logout to destroy SSO session server-side ──────
+              console.log('  🔓 Step 1: Destroying existing Auth0 SSO session...');
+              await page.goto('https://login.stableaudio.com/v2/logout', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+              await sleep(2000);
+
+              // ── Step 2: Clear all cookies + localStorage ──────────────────────────
+              console.log('  🧹 Step 2: Wiping all cookies and storage...');
+              await context.clearCookies();
+              await page.evaluate(() => { try { localStorage.clear(); sessionStorage.clear(); } catch {} }).catch(() => {});
+
+              // ── Step 3: Load Stable Audio fresh ───────────────────────────────────
+              console.log('  🌐 Step 3: Loading fresh Stable Audio page...');
+              await page.goto('https://stableaudio.com', { waitUntil: 'networkidle', timeout: 30000 });
+              await sleep(2000);
+
+              // ── Step 4: Click Sign Up button ─────────────────────────────────────
+              console.log('  🖱️  Step 4: Looking for Sign Up button...');
+              const signupSelectors = [
+                'button:has-text("Sign up")',
+                'button:has-text("Sign Up")',
+                'a:has-text("Sign up")',
+                '[data-testid="signup"]'
+              ];
+              let clicked = false;
+              for (const sel of signupSelectors) {
+                try {
+                  await page.waitForSelector(sel, { timeout: 5000 });
+                  await page.click(sel);
+                  clicked = true;
+                  console.log(`  ✅ Sign Up clicked (${sel})`);
+                  break;
+                } catch {}
+              }
+              if (!clicked) {
+                // Try evaluating in-page
+                clicked = await page.evaluate(() => {
+                  const btn = Array.from(document.querySelectorAll('button')).find(b =>
+                    ['sign up', 'sign-up'].includes(b.textContent.trim().toLowerCase())
+                  );
+                  if (btn) { btn.click(); return true; }
+                  return false;
+                });
+                if (!clicked) throw new Error('Could not find Sign Up button on Stable Audio page.');
+              }
+              await sleep(3000);
+
+              // ── Step 5: Wait for Auth0 email input ───────────────────────────────
+              console.log('  📝 Step 5: Waiting for Auth0 registration form...');
+              await page.waitForSelector('input[name="email"]', { timeout: 20000 });
+
+              // ── Step 6: Fill email + password using React-compatible dispatch ────
+              console.log('  ✍️  Step 6: Filling credentials...');
+              await page.evaluate(({ em, pw }) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                const emailEl = document.querySelector('input[name="email"]');
+                const passEl  = document.querySelector('input[name="password"]');
+                if (emailEl) {
+                  setter.call(emailEl, em);
+                  emailEl.dispatchEvent(new Event('input',  { bubbles: true }));
+                  emailEl.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                if (passEl) {
+                  setter.call(passEl, pw);
+                  passEl.dispatchEvent(new Event('input',  { bubbles: true }));
+                  passEl.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              }, { em: email, pw: password });
+              await sleep(800);
+
+              // ── Step 7: Submit the form ───────────────────────────────────────────
+              console.log('  🚀 Step 7: Submitting registration form...');
+              await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
+              await page.click('button[type="submit"]');
+
+              // ── Step 8: Wait for redirect back to stableaudio.com + token ────────
+              console.log('  ⏳ Step 8: Waiting for authentication redirect + token (up to 60s)...');
+              const tokenDeadline = Date.now() + 60000;
+              while (!capturedToken && Date.now() < tokenDeadline) {
+                // Also try polling localStorage for the Auth0 SPA cache key
+                const lsToken = await page.evaluate(() => {
+                  for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key && (key.includes('auth0') || key.includes('@@auth0spajs@@'))) {
+                      try {
+                        const parsed = JSON.parse(localStorage.getItem(key));
+                        return parsed?.body?.access_token || parsed?.access_token || parsed?.idToken || null;
+                      } catch {}
+                    }
+                  }
+                  return null;
+                }).catch(() => null);
+                if (lsToken) { capturedToken = lsToken; break; }
+                await sleep(1000);
+              }
+
+              if (!capturedToken) throw new Error('Token not captured within 60s after registration.');
+
+              console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
+              console.log(`  📧 ${email}`);
+              console.log(`  🔑 Token: ${capturedToken.slice(0, 30)}...`);
+              return capturedToken;
+
+            } finally {
+              await browser.close().catch(() => {});
+            }
+          }
+
           // ─── STABLE AUDIO API ──────────────────────────────────────────────────────
-          async function generateStableAudio(prompt, lengthSeconds, retryCount = 0) {
+          // Live token — updated automatically when auto-account-creation succeeds
+          let currentToken = STABLE_AUDIO_TOKEN;
+
+          async function generateStableAudio(prompt, lengthSeconds, isRetry = false) {
             const seed = Math.floor(Math.random() * 65536) - 32768;
             console.log(`  🎵 Calling Stable Audio API... (seed: ${seed})`);
 
@@ -274,7 +464,7 @@ jobs:
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${STABLE_AUDIO_TOKEN}`
+                  'Authorization': `Bearer ${currentToken}`
                 },
                 body: JSON.stringify({
                   data: {
@@ -301,13 +491,13 @@ jobs:
                 ))
               );
 
-              if (isLimitError) {
-                console.error('⚠️ Stable Audio API limit reached!');
-                console.error('   The current token has exhausted its API credits.');
-                console.error('   ➡️  Update the STABLE_AUDIO_TOKEN secret with a fresh token and re-run.');
-                throw new Error(`API_LIMIT_REACHED: ${errText.slice(0, 300)}`);
+              if (isLimitError && !isRetry) {
+                console.warn('\n  ⚠️ API limit hit! Auto-creating new Stable Audio account...');
+                currentToken = await createStableAudioAccount();
+                console.log('  🔄 Retrying prompt with new token...');
+                return generateStableAudio(prompt, lengthSeconds, true); // retry once
               }
-
+              if (isLimitError) throw new Error(`API_LIMIT_REACHED (auto-recovery also failed): ${errText.slice(0, 200)}`);
               throw new Error(`Stable Audio API error (${res.status}): ${errText.slice(0, 300)}`);
             }
 
@@ -320,7 +510,7 @@ jobs:
             for (let i = 0; i < maxRetries; i++) {
               process.stdout.write(`  ⏳ Polling result... attempt ${i + 1}/${maxRetries}\r`);
               const res = await fetch(resultUrl, {
-                headers: { 'Authorization': `Bearer ${STABLE_AUDIO_TOKEN}`, 'Accept': '*/*' }
+                headers: { 'Authorization': `Bearer ${currentToken}`, 'Accept': '*/*' }
               });
               if (res.status === 200) {
                 process.stdout.write('\n');
