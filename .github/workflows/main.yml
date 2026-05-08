@@ -416,28 +416,85 @@ jobs:
               await page.waitForSelector('button[type="submit"]', { timeout: 10000 });
               await page.click('button[type="submit"]');
 
-              // ── Step 8: Wait for redirect back to stableaudio.com + token ────────
-              console.log('  ⏳ Step 8: Waiting for authentication redirect + token (up to 60s)...');
-              const tokenDeadline = Date.now() + 60000;
+              // ── Step 8a: Wait for redirect away from auth0 ───────────────────────
+              console.log('  ⏳ Step 8a: Waiting for redirect away from Auth0...');
+              try {
+                await page.waitForURL(
+                  url => !url.includes('auth0') && !url.includes('login.stableaudio'),
+                  { timeout: 60000 }
+                );
+                console.log(`  ✅ Redirected to: ${page.url()}`);
+              } catch {
+                console.warn(`  ⚠️ Still on: ${page.url()} — continuing anyway`);
+              }
+              await sleep(3000);
+
+              // ── Step 8b: Navigate to /generate to force SPA API initialization ─────
+              // The SPA only fires authenticated API requests once it loads the app.
+              // /generate forces the auth module to initialize and emit the Bearer token.
+              console.log('  🎵 Step 8b: Navigating to /generate to force API auth calls...');
+              try {
+                await page.goto('https://stableaudio.com/generate', { waitUntil: 'networkidle', timeout: 30000 });
+              } catch {
+                await page.goto('https://stableaudio.com/generate', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+              }
+              await sleep(4000);
+
+              // ── Step 8c: Multi-strategy token extraction (90s window) ─────────────
+              console.log('  🔍 Step 8c: Extracting token (network sniff + localStorage + fetch intercept)...');
+              const tokenDeadline = Date.now() + 90000;
               while (!capturedToken && Date.now() < tokenDeadline) {
-                // Also try polling localStorage for the Auth0 SPA cache key
+
+                // Strategy 1: Deep localStorage scan (all keys, all value shapes)
                 const lsToken = await page.evaluate(() => {
                   for (let i = 0; i < localStorage.length; i++) {
                     const key = localStorage.key(i);
-                    if (key && (key.includes('auth0') || key.includes('@@auth0spajs@@'))) {
-                      try {
-                        const parsed = JSON.parse(localStorage.getItem(key));
-                        return parsed?.body?.access_token || parsed?.access_token || parsed?.idToken || null;
-                      } catch {}
-                    }
+                    if (!key) continue;
+                    try {
+                      const raw = localStorage.getItem(key);
+                      const parsed = JSON.parse(raw);
+                      // Check nested body.access_token (Auth0 SPA SDK v1)
+                      if (parsed?.body?.access_token) return parsed.body.access_token;
+                      // Flat access_token (Auth0 SPA SDK v2)
+                      if (parsed?.access_token) return parsed.access_token;
+                      // idToken fallback
+                      if (parsed?.idToken) return parsed.idToken;
+                      // Nested decodedToken
+                      if (parsed?.decodedToken?.user?.sub && parsed?.body?.access_token) return parsed.body.access_token;
+                    } catch {}
                   }
                   return null;
                 }).catch(() => null);
                 if (lsToken) { capturedToken = lsToken; break; }
-                await sleep(1000);
+
+                // Strategy 2: Inject fetch interceptor to sniff Authorization header
+                const intercepted = await page.evaluate(() => {
+                  if (window.__sniffedToken) return window.__sniffedToken;
+                  if (!window.__fetchPatched) {
+                    window.__fetchPatched = true;
+                    const origFetch = window.fetch;
+                    window.fetch = function(...args) {
+                      const [url, opts] = args;
+                      const auth = opts?.headers?.Authorization || opts?.headers?.authorization || '';
+                      if (auth.startsWith('Bearer ') && auth.length > 60) {
+                        window.__sniffedToken = auth.replace('Bearer ', '');
+                      }
+                      return origFetch.apply(this, args);
+                    };
+                  }
+                  return null;
+                }).catch(() => null);
+                if (intercepted) { capturedToken = intercepted; break; }
+
+                // Strategy 3: Scroll the generate page to trigger lazy-loaded API calls
+                if ((tokenDeadline - Date.now()) < 60000) {
+                  await page.evaluate(() => window.scrollTo(0, 200)).catch(() => {});
+                }
+
+                await sleep(1500);
               }
 
-              if (!capturedToken) throw new Error('Token not captured within 60s after registration.');
+              if (!capturedToken) throw new Error('Token not captured within 90s. Stable Audio may require email verification or CAPTCHA.');
 
               console.log('  ✅ NEW ACCOUNT CREATED SUCCESSFULLY');
               console.log(`  📧 ${email}`);
