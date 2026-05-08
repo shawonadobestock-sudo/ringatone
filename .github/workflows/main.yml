@@ -5,16 +5,16 @@ on:
     inputs:
       prompts:
         description: |
-          🎵 Music Prompts (one per line)
+          🎵 Music Prompts (one per line) — leave blank to use PROMPTS secret
           Example:
             Piano sad emotional melody ambient pad 80 bpm
             Energetic upbeat dance electronic 128 bpm
-            Cinematic epic orchestral trailer
-        required: true
+        required: false
+        default: ""
         type: string
 
       length_seconds:
-        description: "⏱️ Duration per ringtone (seconds, e.g. 30)"
+        description: "⏱️ Duration per ringtone (seconds, e.g. 5)"
         required: true
         default: "5"
 
@@ -88,8 +88,9 @@ jobs:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
+          PROMPTS_SECRET: ${{ secrets.PROMPTS }}
+          PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
-          PROMPTS_RAW: ${{ github.event.inputs.prompts }}
           LENGTH_SECONDS: ${{ github.event.inputs.length_seconds }}
           AUTO_PROCESS: ${{ github.event.inputs.auto_process }}
           VOLUME_BOOST_PCT: ${{ github.event.inputs.volume_boost_pct }}
@@ -108,7 +109,7 @@ jobs:
           const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
-          const PROMPTS_RAW          = process.env.PROMPTS_RAW || '';
+          const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
           const LENGTH_SECONDS       = parseInt(process.env.LENGTH_SECONDS || '30', 10);
           const AUTO_PROCESS         = process.env.AUTO_PROCESS !== 'false';
           const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
