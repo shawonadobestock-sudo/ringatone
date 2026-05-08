@@ -72,8 +72,16 @@ jobs:
       - name: 📥 Install Dependencies
         run: |
           npm init -y
-          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright
+          npm install node-fetch@3 fluent-ffmpeg @ffmpeg-installer/ffmpeg playwright playwright-extra puppeteer-extra-plugin-stealth
           npx playwright install chromium --with-deps
+
+      - name: 🖥️ Start Virtual Display (Xvfb)
+        run: |
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          echo "✅ Xvfb virtual display started on :99"
 
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
@@ -295,7 +303,6 @@ jobs:
           // Called automatically when Stable Audio API returns a rate-limit error.
           // Returns the new Bearer token string, or throws on failure.
           async function createStableAudioAccount() {
-            const { chromium } = await import('playwright');
             const email    = generateRandomEmail();
             const password = generateStrongPassword();
 
@@ -303,9 +310,20 @@ jobs:
             console.log(`  📧 Email   : ${email}`);
             console.log(`  🔑 Password: ${password}`);
 
+            // Use playwright-extra + stealth plugin → bypasses Auth0 bot detection
+            // Xvfb virtual display is already running (started by the workflow step above)
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
+
             const browser = await chromium.launch({
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+              headless: false,  // Real browser on Xvfb — undetectable by Auth0
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+              ]
             });
 
             let capturedToken = null;
