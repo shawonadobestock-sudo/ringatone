@@ -16,7 +16,7 @@ on:
       length_seconds:
         description: "⏱️ Duration per ringtone (seconds, e.g. 30)"
         required: true
-        default: "30"
+        default: "5"
 
       auto_process:
         description: "🎛️ Auto-process audio (trim silence + volume boost)"
@@ -688,23 +688,18 @@ jobs:
             return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + ext;
           }
 
-          // ─── PROCESS A SINGLE PROMPT ───────────────────────────────────────────────
-          async function processPrompt(idx, prompt) {
-            const num = `[${idx + 1}/${PROMPTS.length}]`;
-            console.log(`\n${num} ─────────────────────────────────────────────`);
-            console.log(`${num} Prompt: "${prompt}"`);
-            console.log(`${num} ─────────────────────────────────────────────`);
-
-            // Step 1: Metadata (Gemini — 4 parallel calls)
+          // ─── GENERATE ONE UNIQUE RINGTONE FOR A SINGLE DB ─────────────────────────
+          // Used by both single-account and all_three modes.
+          // Each call produces a fresh audio (new seed) + fresh metadata → unique upload.
+          async function generateAndPushOne(prompt, dbTarget) {
+            // Step A: Unique metadata per account (Gemini re-called each time)
             let meta;
             try {
               meta = await generateMetadataFromPrompt(prompt);
-              console.log(`  📝 Title: "${meta.title}"`);
-              console.log(`  🏷️  Tags: ${meta.tags}`);
-              console.log(`  📂 Category: ${meta.category}`);
-              console.log(`  📖 Desc: ${meta.description}`);
+              console.log(`  📝 [${dbTarget.name}] Title: "${meta.title}"`);
+              console.log(`  🏷️  [${dbTarget.name}] Tags: ${meta.tags}`);
             } catch (e) {
-              console.warn(`  ⚠️ Metadata generation failed: ${e.message} — using fallback`);
+              console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
               meta = {
                 title: prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
                 tags: '',
@@ -713,28 +708,23 @@ jobs:
               };
             }
 
-            // Step 2: Generate audio with Stable Audio
+            // Step B: Generate unique audio (each call gets a random seed → different sound)
             const { resultUrl } = await generateStableAudio(prompt, LENGTH_SECONDS);
             let audioBuffer = await pollStableAudioResult(resultUrl);
 
-            // Step 3: Optional auto-processing (silence trim + volume boost)
+            // Step C: Optional auto-processing
             if (AUTO_PROCESS) {
-              console.log(`  🎛️  Auto-processing: boost ${Math.round(VOLUME_BOOST * 100)}% | threshold ${SILENCE_THRESHOLD} | pad ${Math.round(PAD_SEC * 1000)}ms`);
               try {
                 audioBuffer = await autoProcessAudio(audioBuffer, VOLUME_BOOST, SILENCE_THRESHOLD, PAD_SEC);
               } catch (e) {
-                console.warn(`  ⚠️ Auto-processing failed: ${e.message} — using raw audio`);
+                console.warn(`  ⚠️ [${dbTarget.name}] Auto-process failed: ${e.message}`);
               }
             }
 
-            // Step 4: Convert to base64
+            // Step D: Push to this specific DB only
             const fileBase64 = `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`;
             const fileName = randomName('.mp3');
-
-            // Step 5: Push to all target Firebase DBs
-            const targetLabel = TARGET_DB_URLS.map(d => d.name).join(' + ');
-            console.log(`  🔥 Pushing to Firebase [${targetLabel}]... (${QUEUE_PATH})`);
-            const pushResults = await firebasePushAll(QUEUE_PATH, {
+            const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
               name: fileName,
               type: 'audio/mpeg',
               size: audioBuffer.length,
@@ -750,11 +740,45 @@ jobs:
               prompt,
               createdAt: Date.now()
             });
-
-            pushResults.forEach(r => console.log(`  ✅ [${r.dbName}] key: ${r.key}`));
-            console.log(`  🎵 "${meta.title}" → ${(audioBuffer.length / 1024).toFixed(0)}KB`);
-            return { keys: pushResults, title: meta.title, category: meta.category };
+            console.log(`  ✅ [${dbTarget.name}] key: ${key}  🎵 "${meta.title}" → ${(audioBuffer.length / 1024).toFixed(0)}KB`);
+            return { dbName: dbTarget.name, key, title: meta.title, category: meta.category };
           }
+
+          // ─── PROCESS A SINGLE PROMPT ───────────────────────────────────────────────
+          async function processPrompt(idx, prompt) {
+            const num = `[${idx + 1}/${PROMPTS.length}]`;
+            console.log(`\n${num} ─────────────────────────────────────────────`);
+            console.log(`${num} Prompt: "${prompt}"`);
+            console.log(`${num} ─────────────────────────────────────────────`);
+
+            if (TARGET_DB_URLS.length === 1) {
+              // ── Single account: 1 audio → 1 DB ─────────────────────────────────────
+              const result = await generateAndPushOne(prompt, TARGET_DB_URLS[0]);
+              return { keys: [result], title: result.title, category: result.category };
+
+            } else {
+              // ── all_three: generate a UNIQUE audio per account (NOT the same file!) ──
+              // Each account gets a different seed → different sound → safe from duplicate detection
+              console.log(`  🔀 all_three mode: generating ${TARGET_DB_URLS.length} UNIQUE audios (one per account)...`);
+              const pushResults = [];
+              for (const dbTarget of TARGET_DB_URLS) {
+                console.log(`\n  ➡️  Generating unique ringtone for [${dbTarget.name}]...`);
+                try {
+                  const result = await generateAndPushOne(prompt, dbTarget);
+                  pushResults.push(result);
+                } catch (e) {
+                  console.error(`  ❌ [${dbTarget.name}] Failed: ${e.message}`);
+                }
+                // Small delay between accounts to avoid API burst
+                if (TARGET_DB_URLS.indexOf(dbTarget) < TARGET_DB_URLS.length - 1) {
+                  await sleep(3000);
+                }
+              }
+              if (!pushResults.length) throw new Error('All account pushes failed.');
+              return { keys: pushResults, title: pushResults[0].title, category: pushResults[0].category };
+            }
+          }
+
 
           // ─── STARTUP: AUTO-CREATE ACCOUNT IF NO TOKEN PROVIDED ─────────────────────
           if (!currentToken) {
