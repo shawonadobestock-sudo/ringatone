@@ -53,6 +53,11 @@ on:
           - zedge_3
           - all_three
 
+      gemini_api_keys:
+        description: "🤖 Gemini API Keys (one per line — overrides secret if filled)"
+        required: false
+        default: ""
+
 jobs:
   generate-ringtones:
     name: 🎵 Generate & Push Ringtones to Firebase
@@ -74,6 +79,7 @@ jobs:
         env:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
           PROMPTS_RAW: ${{ github.event.inputs.prompts }}
           LENGTH_SECONDS: ${{ github.event.inputs.length_seconds }}
@@ -91,7 +97,7 @@ jobs:
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
-          const GEMINI_KEYS_RAW      = process.env.GEMINI_API_KEYS || '';
+          const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
           const PROMPTS_RAW          = process.env.PROMPTS_RAW || '';
@@ -120,14 +126,7 @@ jobs:
           }
 
           // ─── VALIDATION ────────────────────────────────────────────────────────────
-          if (!STABLE_AUDIO_TOKEN) {
-            console.error('❌ STABLE_AUDIO_TOKEN secret not set. Add it in: Repo → Settings → Secrets → Actions');
-            process.exit(1);
-          }
-          if (!FIREBASE_DB_URL) {
-            console.error('❌ Firebase DB URL is empty.');
-            process.exit(1);
-          }
+          // Note: STABLE_AUDIO_TOKEN is OPTIONAL — if empty, account is auto-created at startup
 
           const GEMINI_KEYS = GEMINI_KEYS_RAW
             .split(/[\n,]+/)
@@ -451,8 +450,8 @@ jobs:
           }
 
           // ─── STABLE AUDIO API ──────────────────────────────────────────────────────
-          // Live token — updated automatically when auto-account-creation succeeds
-          let currentToken = STABLE_AUDIO_TOKEN;
+          // Live token — starts empty, set by auto-account-creation or from secret
+          let currentToken = STABLE_AUDIO_TOKEN || null;
 
           async function generateStableAudio(prompt, lengthSeconds, isRetry = false) {
             const seed = Math.floor(Math.random() * 65536) - 32768;
@@ -682,6 +681,21 @@ jobs:
             pushResults.forEach(r => console.log(`  ✅ [${r.dbName}] key: ${r.key}`));
             console.log(`  🎵 "${meta.title}" → ${(audioBuffer.length / 1024).toFixed(0)}KB`);
             return { keys: pushResults, title: meta.title, category: meta.category };
+          }
+
+          // ─── STARTUP: AUTO-CREATE ACCOUNT IF NO TOKEN PROVIDED ─────────────────────
+          if (!currentToken) {
+            console.log('\n⚠️  No STABLE_AUDIO_TOKEN provided — auto-creating Stable Audio account...');
+            try {
+              currentToken = await createStableAudioAccount();
+              console.log('✅ Startup account creation successful. Starting generation...');
+            } catch (startupErr) {
+              console.error(`❌ Startup account creation FAILED: ${startupErr.message}`);
+              console.error('   Cannot proceed without a valid token.');
+              process.exit(1);
+            }
+          } else {
+            console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           }
 
           // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
