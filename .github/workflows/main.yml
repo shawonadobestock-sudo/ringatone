@@ -54,9 +54,17 @@ on:
           - all_three
 
       ollama_model:
-        description: "🤖 Local LLM model for metadata (default: gemma:2b)"
+        description: "🤖 Local LLM model for metadata generation"
         required: false
-        default: "gemma:2b"
+        default: "gemma4:e2b"
+        type: choice
+        options:
+          - gemma4:e2b
+          - gemma:2b
+          - phi3:mini
+          - qwen2.5:3b
+          - llama3.2:3b
+          - mistral:7b
 
 jobs:
   generate-ringtones:
@@ -178,6 +186,7 @@ jobs:
           console.log('============================================================\n');
 
           // ─── LOCAL OLLAMA LLM CALL (replaces Gemini — zero rate limits) ───────────
+          // system prompt forces gemma:2b to skip conversational preamble
           async function callOllama(promptText, retries = 3) {
             for (let attempt = 1; attempt <= retries; attempt++) {
               try {
@@ -186,9 +195,10 @@ jobs:
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     model: OLLAMA_MODEL,
+                    system: 'You are a music metadata assistant. You ONLY output the exact requested data — no greetings, no "Sure", no explanations, no markdown, no extra text. Just the raw answer.',
                     prompt: promptText,
                     stream: false,
-                    options: { temperature: 0.8, num_predict: 256 }
+                    options: { temperature: 0.6, top_p: 0.9, num_predict: 128 }
                   })
                 });
                 if (!res.ok) {
@@ -205,6 +215,24 @@ jobs:
             }
           }
 
+          // Strip LLM conversational preamble from any text response
+          // Handles: "Sure, here is...", "Here's the title:", "**Bold**", etc.
+          function stripPreamble(text) {
+            if (!text) return '';
+            // Remove markdown bold/italic
+            text = text.replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, '$1').trim();
+            // Remove lines that are clearly preamble ("Sure,", "Here is", "I will", etc.)
+            const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+            const preambleRx = /^(sure[,!.]?|here\s+(is|are|'s)|i\s+(will|can|have)|the\s+(title|answer|result|keywords?|category|description)\s*[:is]|output:|result:|answer:)/i;
+            const cleaned = lines.filter(l => !preambleRx.test(l));
+            // Also strip inline preamble from the first segment: "Sure, <actual content>"
+            let result = (cleaned[0] || lines[0] || '').trim();
+            result = result.replace(/^(sure[,!.]?\s*|here\s+(is|are|'s)[^:]*:\s*)/i, '').trim();
+            // Strip leading colons/dashes
+            result = result.replace(/^[-–:]+\s*/, '').trim();
+            return result;
+          }
+
           // ─── VALID RINGTONE CATEGORIES ─────────────────────────────────────────────
           const VALID_RT_CATS = [
             'LATIN', 'MESSAGE_TONES', 'OTHER', 'POP', 'RNB_SOUL', 'REGGAE', 'RELIGIOUS', 'ROCK',
@@ -214,50 +242,118 @@ jobs:
           ];
 
           // ─── METADATA GENERATION (sequential Ollama calls — local, no rate limits) ──
+
+          // Words that must NEVER appear in keyword list (meta/preamble/generic junk)
+          const TAG_BLOCKLIST = new Set([
+            'sure','here','yes','no','the','a','an','and','or','is','are','was','be',
+            'single','word','keywords','keyword','list','output','result','answer','above',
+            'style','genre','mood','instruments','emotions','characteristics','following',
+            'audio','music','sound','song','track','note','tone','file','type','format',
+            'example','below','based','prompt','ringtone','title','description','category'
+          ]);
+
           async function generateMetadataFromPrompt(prompt) {
             console.log(`  🤖 Generating metadata via local Ollama (${OLLAMA_MODEL}) for: "${prompt.slice(0, 60)}..."`);
 
-            // Sequential calls (gemma:2b is small — parallel would overload the runner)
-            const title = await callOllama(
-              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Generate a creative, catchy title that is naturally around 30 characters long. ` +
-              `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
-              `Reply with ONLY the title text, nothing else — no quotes, no explanation.`
+            // ── TITLE ──────────────────────────────────────────────────────────────────
+            const rawTitle = await callOllama(
+              `Ringtone audio prompt: "${prompt}"\n` +
+              `Task: Write a creative ringtone title (max 30 chars). No BPM numbers. No explanation.\n` +
+              `Examples:\n` +
+              `Prompt: "Sad piano ambient 60 bpm" → Midnight Teardrops\n` +
+              `Prompt: "Upbeat dance EDM 128 bpm" → Electric Pulse Rush\n` +
+              `Prompt: "Hip hop trap beat 90 bpm" → Shadow Street Vibes\n` +
+              `Now for the prompt above, output ONLY the title:`
             );
 
-            const keywords = await callOllama(
-              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `List 15 relevant SINGLE-WORD keywords. Each must be one word only — no spaces, no hyphens. ` +
-              `Focus on: audio style, genre, mood, instruments, emotions. ` +
-              `Reply with ONLY a single comma-separated line of keywords, nothing else.`
+            // ── KEYWORDS ───────────────────────────────────────────────────────────────
+            const rawKeywords = await callOllama(
+              `Ringtone audio prompt: "${prompt}"\n` +
+              `Task: Output exactly 15 single-word music keywords, comma-separated. No numbers, no phrases, no explanation.\n` +
+              `Examples:\n` +
+              `Prompt: "Sad piano ambient" → melancholic,piano,ambient,soft,emotional,peaceful,soothing,dreamy,gentle,slow,atmospheric,calm,tender,wistful,serene\n` +
+              `Prompt: "Upbeat EDM dance" → energetic,electronic,dance,upbeat,pulsing,vibrant,powerful,dynamic,exciting,fast,funky,groovy,bass,synth,driving\n` +
+              `Now for the prompt above, output ONLY the comma-separated keywords:`
             );
 
-            const category = await callOllama(
-              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Choose the most appropriate category from this exact list: ${VALID_RT_CATS.join(', ')}\n` +
-              `Reply with ONLY the category name exactly as listed above, nothing else.`
+            // ── CATEGORY ───────────────────────────────────────────────────────────────
+            const rawCategory = await callOllama(
+              `Ringtone audio prompt: "${prompt}"\n` +
+              `Task: Pick ONE category from this list: ${VALID_RT_CATS.join(', ')}\n` +
+              `Examples:\n` +
+              `Prompt: "Sad piano ambient" → CLASSICAL\n` +
+              `Prompt: "Upbeat EDM dance" → DANCE\n` +
+              `Prompt: "Hip hop trap" → HIP_HOP\n` +
+              `Now for the prompt above, output ONLY the category name:`
             );
 
-            const description = await callOllama(
-              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Write a SHORT description in MAXIMUM 5 WORDS capturing the mood/style. ` +
-              `Example: "calm piano lofi beats" or "energetic hip hop groove". ` +
-              `Reply with ONLY the 5 words or fewer, nothing else.`
+            // ── DESCRIPTION ────────────────────────────────────────────────────────────
+            const rawDescription = await callOllama(
+              `Ringtone audio prompt: "${prompt}"\n` +
+              `Task: Write a 3-5 word description of the mood/style. No punctuation. No explanation.\n` +
+              `Examples:\n` +
+              `Prompt: "Sad piano ambient" → calm piano lofi mood\n` +
+              `Prompt: "Upbeat EDM dance" → energetic dance electronic groove\n` +
+              `Prompt: "Hip hop trap" → dark trap hip hop\n` +
+              `Now for the prompt above, output ONLY the short description:`
             );
 
-            const cleanedTags = keywords
+            // ── POST-PROCESS TITLE ─────────────────────────────────────────────────────
+            const cleanTitle = stripPreamble(rawTitle)
+              .replace(/^["'`]|["'`]$/g, '')
+              .replace(/[*_#]/g, '')
+              .split('\n')[0]
+              .trim()
+              .slice(0, 30);
+
+            // ── POST-PROCESS KEYWORDS ──────────────────────────────────────────────────
+            // Find the first line that looks like a comma-separated word list
+            const kwLines = rawKeywords.split('\n').map(l => l.trim()).filter(Boolean);
+            const kwLine = kwLines.find(l => l.includes(',')) || kwLines[0] || '';
+            const seen = new Set();
+            const cleanedTags = kwLine
               .split(',')
-              .map(k => k.replace(/[^a-zA-Z0-9]/g, ''))
-              .filter(k => k && k.length > 0 && k.length <= 24)
+              .map(k => k.replace(/[^a-zA-Z0-9]/g, '').trim())
+              .filter(k => {
+                if (!k || k.length < 2 || k.length > 24) return false;
+                if (TAG_BLOCKLIST.has(k.toLowerCase())) return false;
+                if (seen.has(k.toLowerCase())) return false; // deduplicate
+                seen.add(k.toLowerCase());
+                return true;
+              })
               .slice(0, 10)
               .join(', ');
 
-            const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
+            // ── POST-PROCESS CATEGORY ──────────────────────────────────────────────────
+            // Find first token that matches a valid category
+            const catTokens = rawCategory.toUpperCase().replace(/[^A-Z_\s]/g, ' ').split(/\s+/);
+            let matchedCat = 'OTHER';
+            for (const tok of catTokens) {
+              if (VALID_RT_CATS.includes(tok)) { matchedCat = tok; break; }
+            }
+            // Also try joining adjacent tokens (for HIP_HOP, RNB_SOUL, etc.)
+            if (matchedCat === 'OTHER') {
+              for (let i = 0; i < catTokens.length - 1; i++) {
+                const joined = catTokens[i] + '_' + catTokens[i + 1];
+                if (VALID_RT_CATS.includes(joined)) { matchedCat = joined; break; }
+              }
+            }
+
+            // ── POST-PROCESS DESCRIPTION ───────────────────────────────────────────────
+            const cleanDesc = stripPreamble(rawDescription)
+              .replace(/^["'`]|["'`]$/g, '')
+              .replace(/[*_#.,!?]/g, '')
+              .split('\n')[0]
+              .trim()
+              .split(/\s+/).slice(0, 5).join(' ');
+
+            console.log(`  📝 RAW title: "${rawTitle.slice(0, 50)}"  →  cleaned: "${cleanTitle}"`);
+
             return {
-              title: title.replace(/^["']|["']$/g, '').trim().split('\n')[0].slice(0, 30),
+              title: cleanTitle || prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
               tags: cleanedTags,
-              category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
-              description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
+              category: matchedCat,
+              description: cleanDesc
             };
           }
 
