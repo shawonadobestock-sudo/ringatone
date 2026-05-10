@@ -396,24 +396,30 @@ jobs:
 
           // ─── METADATA GENERATION ───────────────────────────────────────────────────
           async function generateMetadataFromPrompt(prompt) {
-            console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
+            console.log(`  🤖 Generating enhanced metadata for: "${prompt.slice(0, 60)}..."`);
 
-            const TITLE_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Generate a creative, catchy title that is naturally around 30 characters long. ` +
+            const ENHANCE_PROMPT = `I want to generate an AI audio track based on this simple idea: "${prompt}".\n` +
+              `Please rewrite this into a highly detailed, extremely creative, and completely unique text-to-music prompt (max 30 words). ` +
+              `Focus on specific instruments, mood, tempo, and texture to ensure the audio generator produces something entirely unique. ` +
+              `Return ONLY the enhanced prompt, nothing else.`;
+
+            const TITLE_PROMPT = `Based on the audio you just described, ` +
+              `generate a creative, catchy title that is naturally around 20 characters long. ` +
               `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
               `Only provide the title itself, no extra text or instructions.`;
 
-            const KEYWORDS_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
+            const KEYWORDS_PROMPT = `Based on the audio you just described, ` +
+              `extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
               `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
               `Present keywords in a single comma-separated line without punctuation or full stops.`;
 
-            const CATEGORY_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Analyze and select the most appropriate category from this exact list. ` +
-              `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`;
+            const validCategories = VALID_RT_CATS.filter(c => c !== 'OTHER').join(', ');
+            const CATEGORY_PROMPT = `Based on the audio you just described, ` +
+              `analyze and select the most appropriate category from this exact list. ` +
+              `Return only the category name exactly as shown, nothing else: ${validCategories}`;
 
-            const DESC_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-              `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
+            const DESC_PROMPT = `Based on the audio you just described, ` +
+              `write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
               `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
               `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
               `Return ONLY the short description, nothing else.`;
@@ -427,18 +433,22 @@ jobs:
             await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await sleep(2000);
 
-            // Send all 4 prompts sequentially in ONE chat session
-            const [r0, r1, r2, r3] = await callGeminiWeb(
-              [TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+            // Send all 5 prompts sequentially in ONE chat session
+            const [r0, r1, r2, r3, r4] = await callGeminiWeb(
+              [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
               geminiPage
             );
 
-            const finalTitle = cleanTitle(r0);
-            const finalTags = cleanKeywords(r1);
-            const finalCategory = cleanCategory(r2);
-            const finalDesc = cleanDescription(r3);
+            const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim() || prompt;
+            const finalTitle = cleanTitle(r1);
+            const finalTags = cleanKeywords(r2);
+            const finalCategory = cleanCategory(r3);
+            const finalDesc = cleanDescription(r4);
+
+            console.log(`  ✨ Enhanced Prompt: "${enhancedPrompt}"`);
 
             return {
+              enhancedPrompt: enhancedPrompt,
               title: finalTitle,
               tags: finalTags,
               category: finalCategory,
@@ -876,6 +886,7 @@ jobs:
             } catch (e) {
               console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
               meta = {
+                enhancedPrompt: prompt,
                 title: prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
                 tags: '',
                 category: 'OTHER',
@@ -884,7 +895,7 @@ jobs:
             }
 
             // Step B: Generate unique audio (each call gets a random seed → different sound)
-            const { resultUrl } = await generateStableAudio(prompt, LENGTH_SECONDS);
+            const { resultUrl } = await generateStableAudio(meta.enhancedPrompt, LENGTH_SECONDS);
             let audioBuffer = await pollStableAudioResult(resultUrl);
 
             // Step C: Optional auto-processing
