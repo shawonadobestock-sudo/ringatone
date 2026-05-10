@@ -382,12 +382,20 @@ jobs:
 
           // ─── METADATA GENERATION ───────────────────────────────────────────────────
           async function generateMetadataFromPrompt(prompt) {
-            console.log(`  🤖 Generating enhanced metadata for: "${prompt.slice(0, 60)}..."`);
+            console.log(`  🤖 Generating enhanced metadata...`);
 
-            const ENHANCE_PROMPT = `I want to generate an AI audio track based on this simple idea: "${prompt}".\n` +
-              `Please rewrite this into a highly detailed, extremely creative, and completely unique text-to-music prompt (max 30 words). ` +
-              `Focus on specific instruments, mood, tempo, and texture to ensure the audio generator produces something entirely unique. ` +
-              `Return ONLY the enhanced prompt, nothing else.`;
+            const seedList = ['acoustic guitar', 'heavy synth', 'cinematic orchestra', '8-bit chiptune', 'smooth jazz', 'hard rock', 'soft ambient', 'tribal drums', 'experimental noise', 'vocal choir', 'lofi beats', 'funk bass'];
+            const randomInspirations = seedList.sort(() => 0.5 - Math.random()).slice(0, 5).join(', ');
+
+            const ENHANCE_PROMPT = prompt 
+              ? `I want to generate an AI audio track based on this simple idea: "${prompt}".\n` +
+                `Please rewrite this into a highly detailed, extremely creative, and completely unique text-to-music prompt (max 30 words). ` +
+                `Focus on specific instruments, mood, tempo, and texture to ensure the audio generator produces something entirely unique. ` +
+                `Return ONLY the enhanced prompt, nothing else.`
+              : `You are an expert audio designer. Generate a completely random, highly creative, and entirely unique text-to-music prompt (max 30 words) for a ringtone. ` +
+                `To ensure extreme variety, use these as loose inspiration: ${randomInspirations}. ` +
+                `Focus on specific instruments, mood, tempo, and texture. ` +
+                `Return ONLY the generated prompt, nothing else.`;
 
             const TITLE_PROMPT = `Based on the audio you just described, ` +
               `generate a creative, catchy title that is naturally around 20 characters long. ` +
@@ -879,8 +887,8 @@ jobs:
             } catch (e) {
               console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
               meta = {
-                enhancedPrompt: prompt,
-                title: prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
+                enhancedPrompt: prompt || 'electronic synth pulse',
+                title: (prompt || 'Random Ringtone').split(' ').slice(0, 4).join(' ').slice(0, 30),
                 tags: '',
                 category: 'OTHER',
                 description: ''
@@ -925,9 +933,10 @@ jobs:
 
           // ─── PROCESS A SINGLE PROMPT ───────────────────────────────────────────────
           async function processPrompt(idx, prompt) {
-            const num = `[${idx + 1}/${PROMPTS.length}]`;
+            const num = `[${idx + 1}/${AUTO_GENERATE_COUNT}]`;
             console.log(`\n${num} ─────────────────────────────────────────────`);
-            console.log(`${num} Prompt: "${prompt}"`);
+            if (prompt) console.log(`${num} Prompt: "${prompt}"`);
+            else console.log(`${num} Auto-Generating Random Ringtone...`);
             console.log(`${num} ─────────────────────────────────────────────`);
 
             if (TARGET_DB_URLS.length === 1) {
@@ -982,87 +991,38 @@ jobs:
             process.exit(1);
           }
 
-          // ─── AUTO-GENERATE PROMPTS ──────────────────────────────────────────────
-          if (AUTO_GENERATE_COUNT > 0) {
-            console.log(`\n🤖 Auto-generating ${AUTO_GENERATE_COUNT} creative prompts via Gemini...`);
-            
-            const seedList = ['acoustic guitar', 'heavy synth', 'cinematic orchestra', '8-bit chiptune', 'smooth jazz', 'hard rock', 'soft ambient', 'tribal drums', 'experimental noise', 'vocal choir', 'lofi beats', 'funk bass'];
-            const randomInspirations = seedList.sort(() => 0.5 - Math.random()).slice(0, 5).join(', ');
-
-            const validCategories = VALID_RT_CATS.filter(c => c !== 'OTHER').join(', ');
-            const GEN_PROMPT = `You are an expert audio designer. Generate exactly ${AUTO_GENERATE_COUNT} text-to-music prompts that are **100% WILDLY DIFFERENT** from each other. \n\n` +
-              `RULES:\n` +
-              `1. NO REPETITION. Do not use the same instruments, genres, or tempos across different prompts.\n` +
-              `2. DIVERSE CATEGORIES: Target a wide variety of these categories: ${validCategories}.\n` +
-              `3. EXTREME VARIETY: Make them sound completely unrelated (e.g., loud rock, soft ambient, 8-bit retro, orchestral, acoustic folk, weird sound effects).\n` +
-              `4. KEEP IT SHORT: Max 15 words per prompt.\n` +
-              `5. RANDOM INSPIRATION SEEDS: ${randomInspirations}.\n\n` +
-              `Return them ONLY as a numbered list wrapped inside <output>...</output> tags.\n` +
-              `Example:\n<output>\n1. A calm piano lofi beat\n2. Energetic electronic dance music with heavy bass\n</output>\n` +
-              `IMPORTANT: Do not add any introductory text or explanation, JUST the wrapped list.`;
-              
-            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await sleep(2000);
-            
-            try {
-              const [genRes] = await callGeminiWeb([GEN_PROMPT], geminiPage);
-              
-              const matchTag = genRes.match(/<output>([\s\S]*?)<\/output>/i);
-              const contentToParse = matchTag ? matchTag[1] : genRes;
-
-              const newPrompts = contentToParse.split('\n')
-                .map(l => l.trim())
-                .map(l => {
-                  const match = l.match(/^(?:[*#\-\s]*)(?:\*\*)?\d+(?:\.\)|\.|\))?(?:\*\*)?\s+(.*)/);
-                  return match ? match[1].replace(/[*"']/g, '').trim() : '';
-                })
-                .filter(p => p.length > 5);
-                
-              if (newPrompts.length > 0) {
-                PROMPTS = newPrompts.slice(0, AUTO_GENERATE_COUNT);
-                console.log(`✅ Auto-generated ${PROMPTS.length} prompts successfully!`);
-                PROMPTS.forEach((p, idx) => console.log(`   ${idx + 1}. ${p}`));
-              } else {
-                throw new Error('Failed to parse numbered list from Gemini output.');
-              }
-            } catch (err) {
-              console.error(`❌ Auto-generation failed: ${err.message}`);
-              process.exit(1);
-            }
-          }
-
-          if (!PROMPTS.length) {
-            console.error('❌ No prompts found. Auto-Generate failed or was disabled (count = 0).');
-            process.exit(1);
-          }
-
           // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
           let successCount = 0;
           let failedCount = 0;
           const results = [];
 
-          for (let i = 0; i < PROMPTS.length; i++) {
+          if (AUTO_GENERATE_COUNT === 0) {
+            console.log('✅ AUTO_GENERATE_COUNT is 0. Nothing to do.');
+            process.exit(0);
+          }
+
+          for (let i = 0; i < AUTO_GENERATE_COUNT; i++) {
             try {
-              const result = await processPrompt(i, PROMPTS[i]);
-              results.push({ status: 'success', ...result, prompt: PROMPTS[i] });
+              const result = await processPrompt(i, null);
+              results.push({ status: 'success', ...result, prompt: 'Auto-Generated' });
               successCount++;
             } catch (err) {
               console.error(`\n❌ Prompt ${i + 1} FAILED: ${err.message}`);
-              results.push({ status: 'failed', prompt: PROMPTS[i], error: err.message });
+              results.push({ status: 'failed', prompt: 'Auto-Generated', error: err.message });
               failedCount++;
 
               // If API limit is hit, abort remaining prompts
               if (err.message.startsWith('API_LIMIT_REACHED')) {
                 console.error('\n🛑 Aborting: Stable Audio API credits exhausted.');
                 console.error('   Update STABLE_AUDIO_TOKEN secret with a fresh token and re-run.');
-                for (let j = i + 1; j < PROMPTS.length; j++) {
-                  results.push({ status: 'skipped', prompt: PROMPTS[j] });
+                for (let j = i + 1; j < AUTO_GENERATE_COUNT; j++) {
+                  results.push({ status: 'skipped', prompt: 'Auto-Generated' });
                 }
                 break;
               }
 
               // Small delay before retrying next prompt
-              if (i < PROMPTS.length - 1) {
+              if (i < AUTO_GENERATE_COUNT - 1) {
                 console.log('  ⏳ Waiting 5s before next prompt...');
                 await sleep(5000);
               }
@@ -1080,9 +1040,9 @@ jobs:
           console.log('\n============================================================');
           console.log('  🏁  GENERATION COMPLETE');
           console.log('============================================================');
-          console.log(`✅ Success : ${successCount}/${PROMPTS.length}`);
-          console.log(`❌ Failed  : ${failedCount}/${PROMPTS.length}`);
-          console.log(`⏭️  Skipped : ${skippedCount}/${PROMPTS.length}`);
+          console.log(`✅ Success : ${successCount}/${AUTO_GENERATE_COUNT}`);
+          console.log(`❌ Failed  : ${failedCount}/${AUTO_GENERATE_COUNT}`);
+          console.log(`⏭️  Skipped : ${skippedCount}/${AUTO_GENERATE_COUNT}`);
           console.log('');
           console.log('📋 Results:');
           results.forEach((r, i) => {
@@ -1096,7 +1056,7 @@ jobs:
           });
           console.log('============================================================');
 
-          if (failedCount === PROMPTS.length) {
+          if (failedCount === AUTO_GENERATE_COUNT) {
             process.exit(1);
           }
           SCRIPT_EOF
