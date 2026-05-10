@@ -997,19 +997,26 @@ jobs:
               `3. EXTREME VARIETY: Make them sound completely unrelated (e.g., loud rock, soft ambient, 8-bit retro, orchestral, acoustic folk, weird sound effects).\n` +
               `4. KEEP IT SHORT: Max 15 words per prompt.\n` +
               `5. RANDOM INSPIRATION SEEDS: ${randomInspirations}.\n\n` +
-              `Return them ONLY as a numbered list. Example:\n1. A calm piano lofi beat\n2. Energetic electronic dance music with heavy bass\n` +
-              `IMPORTANT: Do not add any introductory text or explanation, JUST the numbered list.`;
+              `Return them ONLY as a numbered list wrapped inside <output>...</output> tags.\n` +
+              `Example:\n<output>\n1. A calm piano lofi beat\n2. Energetic electronic dance music with heavy bass\n</output>\n` +
+              `IMPORTANT: Do not add any introductory text or explanation, JUST the wrapped list.`;
               
             await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
             await sleep(2000);
             
             try {
               const [genRes] = await callGeminiWeb([GEN_PROMPT], geminiPage);
-              const newPrompts = genRes.split('\n')
+              
+              const matchTag = genRes.match(/<output>([\s\S]*?)<\/output>/i);
+              const contentToParse = matchTag ? matchTag[1] : genRes;
+
+              const newPrompts = contentToParse.split('\n')
                 .map(l => l.trim())
-                .filter(l => /^\d+[\.\)]/.test(l))
-                .map(l => l.replace(/^\d+[\.\)]\s*/, '').replace(/^["']|["']$/g, '').trim())
-                .filter(Boolean);
+                .map(l => {
+                  const match = l.match(/^(?:[*#\-\s]*)(?:\*\*)?\d+(?:\.\)|\.|\))?(?:\*\*)?\s+(.*)/);
+                  return match ? match[1].replace(/[*"']/g, '').trim() : '';
+                })
+                .filter(p => p.length > 5);
                 
               if (newPrompts.length > 0) {
                 PROMPTS = newPrompts.slice(0, AUTO_GENERATE_COUNT);
