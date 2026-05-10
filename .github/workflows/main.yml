@@ -53,18 +53,10 @@ on:
           - zedge_3
           - all_three
 
-      ollama_model:
-        description: "🤖 Local LLM model for metadata generation"
+      gemini_session:
+        description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
         required: false
-        default: "gemma4:e2b"
-        type: choice
-        options:
-          - gemma4:e2b
-          - gemma:2b
-          - phi3:mini
-          - qwen2.5:3b
-          - llama3.2:3b
-          - mistral:7b
+        default: ""
 
 jobs:
   generate-ringtones:
@@ -76,19 +68,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: 🤖 Install & Start Ollama (Local LLM)
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          export OLLAMA_HOST="0.0.0.0:11434"
-          export OLLAMA_ORIGINS="*"
-          ollama serve &
-          echo "⏳ Waiting for Ollama to initialize..."
-          sleep 15
-          MODEL="${{ github.event.inputs.ollama_model || 'gemma:2b' }}"
-          echo "📥 Pulling model: $MODEL"
-          ollama pull "$MODEL"
-          echo "✅ Ollama is ready with model: $MODEL"
 
       - name: 📥 Install Dependencies
         run: |
@@ -107,6 +86,8 @@ jobs:
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
+          GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
+          GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
           PROMPTS_SECRET: ${{ secrets.PROMPTS }}
           PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
@@ -115,7 +96,6 @@ jobs:
           VOLUME_BOOST_PCT: ${{ github.event.inputs.volume_boost_pct }}
           SILENCE_THRESHOLD: ${{ github.event.inputs.silence_threshold }}
           PAD_MS: ${{ github.event.inputs.pad_ms }}
-          OLLAMA_MODEL: ${{ github.event.inputs.ollama_model || 'gemma:2b' }}
         run: |
           cat > generator.mjs << 'SCRIPT_EOF'
           import fetch from 'node-fetch';
@@ -126,6 +106,7 @@ jobs:
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
+          const GEMINI_SESSION_RAW   = (process.env.GEMINI_SESSION_INPUT?.trim() || process.env.GEMINI_SESSION || '').trim();
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
           const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
@@ -134,8 +115,20 @@ jobs:
           const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
           const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
           const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
-          const OLLAMA_MODEL         = (process.env.OLLAMA_MODEL || 'gemma:2b').trim();
-          const OLLAMA_URL           = 'http://localhost:11434/api/generate';
+
+          // Parse Gemini session
+          if (!GEMINI_SESSION_RAW) {
+            console.error('❌ Error: GEMINI_SESSION secret or input is missing. Direct Gemini Web Session is required.');
+            process.exit(1);
+          }
+          let GEMINI_STORAGE_STATE = null;
+          try {
+            GEMINI_STORAGE_STATE = JSON.parse(GEMINI_SESSION_RAW);
+            console.log('🌐 Gemini Web Session loaded successfully (no API key needed!)');
+          } catch (e) {
+            console.error('❌ Error: GEMINI_SESSION is not valid JSON. Please check your storageState JSON export.');
+            process.exit(1);
+          }
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           const FIREBASE_DB_MAP = {
@@ -157,6 +150,8 @@ jobs:
 
           // ─── VALIDATION ────────────────────────────────────────────────────────────
           // Note: STABLE_AUDIO_TOKEN is OPTIONAL — if empty, account is auto-created at startup
+
+
 
           const PROMPTS = PROMPTS_RAW
             .split('\n')
@@ -182,55 +177,74 @@ jobs:
           console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
           TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
           console.log(`📂 Queue Path: ${QUEUE_PATH}`);
-          console.log(`🤖 Local LLM: Ollama / ${OLLAMA_MODEL} (no API key needed)`);
+          console.log(`🌐 Gemini Mode : Web scraping (gemini.google.com) — direct session!`);
           console.log('============================================================\n');
 
-          // ─── LOCAL OLLAMA LLM CALL (replaces Gemini — zero rate limits) ───────────
-          // system prompt forces gemma:2b to skip conversational preamble
-          async function callOllama(promptText, retries = 3) {
-            for (let attempt = 1; attempt <= retries; attempt++) {
-              try {
-                const res = await fetch(OLLAMA_URL, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    model: OLLAMA_MODEL,
-                    system: 'You are a music metadata assistant. You ONLY output the exact requested data — no greetings, no "Sure", no explanations, no markdown, no extra text. Just the raw answer.',
-                    prompt: promptText,
-                    stream: false,
-                    options: { temperature: 0.6, top_p: 0.9, num_predict: 128 }
-                  })
-                });
-                if (!res.ok) {
-                  const err = await res.text();
-                  throw new Error(`Ollama error (${res.status}): ${err.slice(0, 200)}`);
-                }
-                const data = await res.json();
-                return (data.response || '').trim();
-              } catch (e) {
-                if (attempt >= retries) throw e;
-                console.warn(`  ⚠️ Ollama attempt ${attempt} failed: ${e.message}. Retrying...`);
-                await sleep(3000);
-              }
-            }
-          }
+          // ─── GEMINI VIA WEB SCRAPING (uses saved Google session) ───────────────────
+          // Uses confirmed DOM selectors from live gemini.google.com HTML:
+          //   Input  : div.ql-editor[contenteditable="true"]  (QuillJS editor)
+          //   Send   : button[aria-label="Send message"]
+          //   Done   : div.response-footer.complete  ← CSS class added when streaming ends
+          //   Text   : div[id^="model-response-message-content"]
+          async function callGeminiWeb(promptTexts, geminiPage) {
+            // promptTexts is an array — we send them all in sequence in one chat session
+            // Returns array of response strings, one per prompt
+            const responses = [];
 
-          // Strip LLM conversational preamble from any text response
-          // Handles: "Sure, here is...", "Here's the title:", "**Bold**", etc.
-          function stripPreamble(text) {
-            if (!text) return '';
-            // Remove markdown bold/italic
-            text = text.replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, '$1').trim();
-            // Remove lines that are clearly preamble ("Sure,", "Here is", "I will", etc.)
-            const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-            const preambleRx = /^(sure[,!.]?|here\s+(is|are|'s)|i\s+(will|can|have)|the\s+(title|answer|result|keywords?|category|description)\s*[:is]|output:|result:|answer:)/i;
-            const cleaned = lines.filter(l => !preambleRx.test(l));
-            // Also strip inline preamble from the first segment: "Sure, <actual content>"
-            let result = (cleaned[0] || lines[0] || '').trim();
-            result = result.replace(/^(sure[,!.]?\s*|here\s+(is|are|'s)[^:]*:\s*)/i, '').trim();
-            // Strip leading colons/dashes
-            result = result.replace(/^[-–:]+\s*/, '').trim();
-            return result;
+            for (let i = 0; i < promptTexts.length; i++) {
+              const prompt = promptTexts[i];
+              console.log(`    🌐 [Web ${i+1}/${promptTexts.length}] Sending prompt (${prompt.length} chars)...`);
+
+              // Count existing response-footer.complete divs before sending
+              const prevDoneCount = await geminiPage.evaluate(() =>
+                document.querySelectorAll('div.response-footer.complete').length
+              );
+
+              // Click input and type prompt
+              const inputSel = 'div.ql-editor[contenteditable="true"]';
+              await geminiPage.waitForSelector(inputSel, { timeout: 15000 });
+              await geminiPage.click(inputSel);
+
+              // Clear any existing text (Ctrl+A then type)
+              await geminiPage.keyboard.press('Control+a');
+              await sleep(100);
+              // Type character by character to avoid QuillJS issues
+              await geminiPage.keyboard.type(prompt, { delay: 5 });
+              await sleep(400);
+
+              // Click send button
+              const sendSel = 'button[aria-label="Send message"]';
+              await geminiPage.waitForSelector(sendSel, { timeout: 10000 });
+              await geminiPage.click(sendSel);
+
+              // Wait for a NEW response-footer.complete to appear
+              // This class is added EXACTLY when streaming finishes — confirmed from DOM
+              const deadline = Date.now() + 90000;
+              let responseText = '';
+              while (Date.now() < deadline) {
+                await sleep(1500);
+                const doneCount = await geminiPage.evaluate(() =>
+                  document.querySelectorAll('div.response-footer.complete').length
+                );
+                if (doneCount > prevDoneCount) {
+                  // New response is complete — extract the LAST response text
+                  responseText = await geminiPage.evaluate(() => {
+                    const allDivs = document.querySelectorAll('div[id^="model-response-message-content"]');
+                    const last = allDivs[allDivs.length - 1];
+                    return last ? last.innerText.trim() : '';
+                  });
+                  break;
+                }
+              }
+
+              if (!responseText) {
+                throw new Error(`Gemini web timeout: no response for prompt ${i+1} within 90s`);
+              }
+              console.log(`    ✅ [Web ${i+1}] Got response (${responseText.length} chars)`);
+              responses.push(responseText);
+              await sleep(800); // Brief pause between prompts
+            }
+            return responses;
           }
 
           // ─── VALID RINGTONE CATEGORIES ─────────────────────────────────────────────
@@ -241,119 +255,88 @@ jobs:
             'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
           ];
 
-          // ─── METADATA GENERATION (sequential Ollama calls — local, no rate limits) ──
-
-          // Words that must NEVER appear in keyword list (meta/preamble/generic junk)
-          const TAG_BLOCKLIST = new Set([
-            'sure','here','yes','no','the','a','an','and','or','is','are','was','be',
-            'single','word','keywords','keyword','list','output','result','answer','above',
-            'style','genre','mood','instruments','emotions','characteristics','following',
-            'audio','music','sound','song','track','note','tone','file','type','format',
-            'example','below','based','prompt','ringtone','title','description','category'
-          ]);
-
+          // ─── METADATA GENERATION ───────────────────────────────────────────────────
+          // Web mode: opens ONE browser, sends 4 prompts sequentially (fast, no re-login)
+          // API mode: sends 4 prompts in parallel (original behaviour)
           async function generateMetadataFromPrompt(prompt) {
-            console.log(`  🤖 Generating metadata via local Ollama (${OLLAMA_MODEL}) for: "${prompt.slice(0, 60)}..."`);
+            console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
 
-            // ── TITLE ──────────────────────────────────────────────────────────────────
-            const rawTitle = await callOllama(
-              `Ringtone audio prompt: "${prompt}"\n` +
-              `Task: Write a creative ringtone title (max 30 chars). No BPM numbers. No explanation.\n` +
-              `Examples:\n` +
-              `Prompt: "Sad piano ambient 60 bpm" → Midnight Teardrops\n` +
-              `Prompt: "Upbeat dance EDM 128 bpm" → Electric Pulse Rush\n` +
-              `Prompt: "Hip hop trap beat 90 bpm" → Shadow Street Vibes\n` +
-              `Now for the prompt above, output ONLY the title:`
-            );
+            const TITLE_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Generate a creative, catchy title that is naturally around 30 characters long. ` +
+              `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
+              `Only provide the title itself, no extra text or instructions.`;
 
-            // ── KEYWORDS ───────────────────────────────────────────────────────────────
-            const rawKeywords = await callOllama(
-              `Ringtone audio prompt: "${prompt}"\n` +
-              `Task: Output exactly 15 single-word music keywords, comma-separated. No numbers, no phrases, no explanation.\n` +
-              `Examples:\n` +
-              `Prompt: "Sad piano ambient" → melancholic,piano,ambient,soft,emotional,peaceful,soothing,dreamy,gentle,slow,atmospheric,calm,tender,wistful,serene\n` +
-              `Prompt: "Upbeat EDM dance" → energetic,electronic,dance,upbeat,pulsing,vibrant,powerful,dynamic,exciting,fast,funky,groovy,bass,synth,driving\n` +
-              `Now for the prompt above, output ONLY the comma-separated keywords:`
-            );
+            const KEYWORDS_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
+              `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
+              `Present keywords in a single comma-separated line without punctuation or full stops.`;
 
-            // ── CATEGORY ───────────────────────────────────────────────────────────────
-            const rawCategory = await callOllama(
-              `Ringtone audio prompt: "${prompt}"\n` +
-              `Task: Pick ONE category from this list: ${VALID_RT_CATS.join(', ')}\n` +
-              `Examples:\n` +
-              `Prompt: "Sad piano ambient" → CLASSICAL\n` +
-              `Prompt: "Upbeat EDM dance" → DANCE\n` +
-              `Prompt: "Hip hop trap" → HIP_HOP\n` +
-              `Now for the prompt above, output ONLY the category name:`
-            );
+            const CATEGORY_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Analyze and select the most appropriate category from this exact list. ` +
+              `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`;
 
-            // ── DESCRIPTION ────────────────────────────────────────────────────────────
-            const rawDescription = await callOllama(
-              `Ringtone audio prompt: "${prompt}"\n` +
-              `Task: Write a 3-5 word description of the mood/style. No punctuation. No explanation.\n` +
-              `Examples:\n` +
-              `Prompt: "Sad piano ambient" → calm piano lofi mood\n` +
-              `Prompt: "Upbeat EDM dance" → energetic dance electronic groove\n` +
-              `Prompt: "Hip hop trap" → dark trap hip hop\n` +
-              `Now for the prompt above, output ONLY the short description:`
-            );
+            const DESC_PROMPT = `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
+              `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
+              `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
+              `Return ONLY the short description, nothing else.`;
 
-            // ── POST-PROCESS TITLE ─────────────────────────────────────────────────────
-            const cleanTitle = stripPreamble(rawTitle)
-              .replace(/^["'`]|["'`]$/g, '')
-              .replace(/[*_#]/g, '')
-              .split('\n')[0]
-              .trim()
-              .slice(0, 30);
+            // ── WEB MODE: 1 browser, 4 sequential prompts in one chat session ─────
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
 
-            // ── POST-PROCESS KEYWORDS ──────────────────────────────────────────────────
-            // Find the first line that looks like a comma-separated word list
-            const kwLines = rawKeywords.split('\n').map(l => l.trim()).filter(Boolean);
-            const kwLine = kwLines.find(l => l.includes(',')) || kwLines[0] || '';
-            const seen = new Set();
-            const cleanedTags = kwLine
+            const browser = await chromium.launch({
+              headless: false,  // Xvfb virtual display
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                     '--disable-blink-features=AutomationControlled']
+            });
+            let title, keywords, category, description;
+            try {
+              const context = await browser.newContext({
+                storageState: GEMINI_STORAGE_STATE,
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                viewport: { width: 1280, height: 800 }
+              });
+              const page = await context.newPage();
+
+              // Navigate to a NEW Gemini chat (avoids context bleed between prompts/runs)
+              console.log('  🌐 Loading gemini.google.com/app/new ...');
+              await page.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await sleep(3000);
+
+              // Verify logged in — check for the QuillJS input
+              const inputVisible = await page.isVisible('div.ql-editor[contenteditable="true"]').catch(() => false);
+              if (!inputVisible) {
+                console.warn('  ⚠️ Gemini session may be expired — input not found. Check GEMINI_SESSION secret.');
+                throw new Error('Gemini web: input not found — session likely expired');
+              }
+              console.log('  ✅ Gemini web session active!');
+
+              // Send all 4 prompts sequentially in ONE chat
+              const [r0, r1, r2, r3] = await callGeminiWeb(
+                [TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+                page
+              );
+              title = r0; keywords = r1; category = r2; description = r3;
+
+            } finally {
+              await browser.close().catch(() => {});
+            }
+
+            const cleanedTags = keywords
               .split(',')
-              .map(k => k.replace(/[^a-zA-Z0-9]/g, '').trim())
-              .filter(k => {
-                if (!k || k.length < 2 || k.length > 24) return false;
-                if (TAG_BLOCKLIST.has(k.toLowerCase())) return false;
-                if (seen.has(k.toLowerCase())) return false; // deduplicate
-                seen.add(k.toLowerCase());
-                return true;
-              })
+              .map(k => k.replace(/[^a-zA-Z0-9]/g, ''))
+              .filter(k => k && k.length > 0 && k.length <= 24)
               .slice(0, 10)
               .join(', ');
 
-            // ── POST-PROCESS CATEGORY ──────────────────────────────────────────────────
-            // Find first token that matches a valid category
-            const catTokens = rawCategory.toUpperCase().replace(/[^A-Z_\s]/g, ' ').split(/\s+/);
-            let matchedCat = 'OTHER';
-            for (const tok of catTokens) {
-              if (VALID_RT_CATS.includes(tok)) { matchedCat = tok; break; }
-            }
-            // Also try joining adjacent tokens (for HIP_HOP, RNB_SOUL, etc.)
-            if (matchedCat === 'OTHER') {
-              for (let i = 0; i < catTokens.length - 1; i++) {
-                const joined = catTokens[i] + '_' + catTokens[i + 1];
-                if (VALID_RT_CATS.includes(joined)) { matchedCat = joined; break; }
-              }
-            }
-
-            // ── POST-PROCESS DESCRIPTION ───────────────────────────────────────────────
-            const cleanDesc = stripPreamble(rawDescription)
-              .replace(/^["'`]|["'`]$/g, '')
-              .replace(/[*_#.,!?]/g, '')
-              .split('\n')[0]
-              .trim()
-              .split(/\s+/).slice(0, 5).join(' ');
-
-            console.log(`  📝 RAW title: "${rawTitle.slice(0, 50)}"  →  cleaned: "${cleanTitle}"`);
-
+            const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
             return {
-              title: cleanTitle || prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
+              title: title.replace(/^["']|["']$/g, '').slice(0, 30),
               tags: cleanedTags,
-              category: matchedCat,
-              description: cleanDesc
+              category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
+              description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
             };
           }
 
