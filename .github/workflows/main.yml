@@ -53,19 +53,10 @@ on:
           - zedge_3
           - all_three
 
-      gemini_api_keys:
-        description: "🤖 Gemini API Keys (one per line — overrides secret if filled)"
+      ollama_model:
+        description: "🤖 Local LLM model for metadata (default: gemma:2b)"
         required: false
-        default: ""
-
-      use_local_gemma:
-        description: "🦙 Use Local Gemma 4 via Ollama (No API limits, runs natively on runner!)"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+        default: "gemma:2b"
 
 jobs:
   generate-ringtones:
@@ -78,14 +69,18 @@ jobs:
         with:
           node-version: 20
 
-      - name: 🦙 Install & Start Local Ollama (Gemma 4)
-        if: ${{ github.event.inputs.use_local_gemma == 'true' }}
+      - name: 🤖 Install & Start Ollama (Local LLM)
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
+          export OLLAMA_HOST="0.0.0.0:11434"
+          export OLLAMA_ORIGINS="*"
           ollama serve &
-          sleep 10
-          echo "Pulling gemma4:e2b..."
-          ollama pull gemma4:e2b
+          echo "⏳ Waiting for Ollama to initialize..."
+          sleep 15
+          MODEL="${{ github.event.inputs.ollama_model || 'gemma:2b' }}"
+          echo "📥 Pulling model: $MODEL"
+          ollama pull "$MODEL"
+          echo "✅ Ollama is ready with model: $MODEL"
 
       - name: 📥 Install Dependencies
         run: |
@@ -104,9 +99,6 @@ jobs:
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
-          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
-          GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
-          USE_LOCAL_GEMMA: ${{ github.event.inputs.use_local_gemma }}
           PROMPTS_SECRET: ${{ secrets.PROMPTS }}
           PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
@@ -115,6 +107,7 @@ jobs:
           VOLUME_BOOST_PCT: ${{ github.event.inputs.volume_boost_pct }}
           SILENCE_THRESHOLD: ${{ github.event.inputs.silence_threshold }}
           PAD_MS: ${{ github.event.inputs.pad_ms }}
+          OLLAMA_MODEL: ${{ github.event.inputs.ollama_model || 'gemma:2b' }}
         run: |
           cat > generator.mjs << 'SCRIPT_EOF'
           import fetch from 'node-fetch';
@@ -125,9 +118,6 @@ jobs:
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
-          const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
-          const USE_LOCAL_GEMMA      = process.env.USE_LOCAL_GEMMA === 'true';
-          const OLLAMA_URL           = USE_LOCAL_GEMMA ? 'http://localhost:11434' : '';
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
           const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
@@ -136,6 +126,8 @@ jobs:
           const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
           const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
           const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
+          const OLLAMA_MODEL         = (process.env.OLLAMA_MODEL || 'gemma:2b').trim();
+          const OLLAMA_URL           = 'http://localhost:11434/api/generate';
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           const FIREBASE_DB_MAP = {
@@ -157,16 +149,6 @@ jobs:
 
           // ─── VALIDATION ────────────────────────────────────────────────────────────
           // Note: STABLE_AUDIO_TOKEN is OPTIONAL — if empty, account is auto-created at startup
-
-          const GEMINI_KEYS = GEMINI_KEYS_RAW
-            .split(/[\n,]+/)
-            .map(k => k.trim())
-            .filter(k => k.length > 10);
-
-          if (!GEMINI_KEYS.length && !OLLAMA_URL) {
-            console.error('❌ Neither GEMINI_API_KEYS nor OLLAMA_URL is set. Please provide at least one.');
-            process.exit(1);
-          }
 
           const PROMPTS = PROMPTS_RAW
             .split('\n')
@@ -192,81 +174,33 @@ jobs:
           console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
           TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
           console.log(`📂 Queue Path: ${QUEUE_PATH}`);
-          console.log(`🤖 Gemini Keys: ${GEMINI_KEYS.length}`);
+          console.log(`🤖 Local LLM: Ollama / ${OLLAMA_MODEL} (no API key needed)`);
           console.log('============================================================\n');
 
-          // ─── GEMINI KEY ROTATION ───────────────────────────────────────────────────
-          let _geminiKeyIdx = 0;
-          function getNextGeminiKey() {
-            const key = GEMINI_KEYS[_geminiKeyIdx % GEMINI_KEYS.length];
-            _geminiKeyIdx = (_geminiKeyIdx + 1) % GEMINI_KEYS.length;
-            return key;
-          }
-
-          const GEMINI_MODEL = 'gemini-3.1-flash-lite';
-
-          async function callGemini(promptText, retries = 3) {
-            // Route to Ollama if URL is provided
-            if (OLLAMA_URL) {
-              for (let attempt = 1; attempt <= retries; attempt++) {
-                try {
-                  const res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      model: 'gemma4:e2b',
-                      messages: [{ role: 'user', content: promptText }],
-                      temperature: 1,
-                      top_p: 0.95,
-                      max_tokens: 1024
-                    })
-                  });
-                  if (!res.ok) throw new Error(`Ollama error (${res.status}): ${await res.text()}`);
-                  const data = await res.json();
-                  return data.choices[0].message.content.trim();
-                } catch (e) {
-                  if (attempt >= retries) throw e;
-                  console.warn(`  ⚠️ Ollama attempt ${attempt} failed: ${e.message}. Retrying...`);
-                  await sleep(2000);
-                }
-              }
-            }
-
-            // Fallback to Gemini if no Ollama URL
+          // ─── LOCAL OLLAMA LLM CALL (replaces Gemini — zero rate limits) ───────────
+          async function callOllama(promptText, retries = 3) {
             for (let attempt = 1; attempt <= retries; attempt++) {
-              const apiKey = getNextGeminiKey();
               try {
-                const res = await fetch(
-                  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-                  {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-                    body: JSON.stringify({
-                      contents: [{ parts: [{ text: promptText }] }],
-                      generationConfig: { temperature: 1, topP: 0.95, topK: 40, maxOutputTokens: 1024 }
-                    })
-                  }
-                );
+                const res = await fetch(OLLAMA_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    model: OLLAMA_MODEL,
+                    prompt: promptText,
+                    stream: false,
+                    options: { temperature: 0.8, num_predict: 256 }
+                  })
+                });
                 if (!res.ok) {
                   const err = await res.text();
-                  if (res.status === 429) {
-                    console.warn(`  ⚠️ Gemini rate limit (429) hit. Waiting 1 minute before retrying...`);
-                    await sleep(60000);
-                    attempt--; // Do not count rate limits against max retries
-                    continue;
-                  }
-                  if (attempt < retries) {
-                    console.warn(`  ⚠️ Gemini attempt ${attempt} failed (${res.status}). Retrying with next key...`);
-                    await sleep(2000);
-                    continue;
-                  }
-                  throw new Error(`Gemini error (${res.status}): ${err.slice(0, 200)}`);
+                  throw new Error(`Ollama error (${res.status}): ${err.slice(0, 200)}`);
                 }
                 const data = await res.json();
-                return data.candidates[0].content.parts.map(p => p.text).join('').trim();
+                return (data.response || '').trim();
               } catch (e) {
                 if (attempt >= retries) throw e;
-                await sleep(2000);
+                console.warn(`  ⚠️ Ollama attempt ${attempt} failed: ${e.message}. Retrying...`);
+                await sleep(3000);
               }
             }
           }
@@ -279,36 +213,37 @@ jobs:
             'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
           ];
 
-          // ─── METADATA GENERATION (4 parallel Gemini calls) ────────────────────────
+          // ─── METADATA GENERATION (sequential Ollama calls — local, no rate limits) ──
           async function generateMetadataFromPrompt(prompt) {
-            console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
+            console.log(`  🤖 Generating metadata via local Ollama (${OLLAMA_MODEL}) for: "${prompt.slice(0, 60)}..."`);
 
-            const [title, keywords, category, description] = await Promise.all([
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Generate a creative, catchy title that is naturally around 30 characters long. ` +
-                `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
-                `Only provide the title itself, no extra text or instructions.`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
-                `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
-                `Present keywords in a single comma-separated line without punctuation or full stops.`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Analyze and select the most appropriate category from this exact list. ` +
-                `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
-                `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
-                `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
-                `Return ONLY the short description, nothing else.`
-              )
-            ]);
+            // Sequential calls (gemma:2b is small — parallel would overload the runner)
+            const title = await callOllama(
+              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Generate a creative, catchy title that is naturally around 30 characters long. ` +
+              `IMPORTANT: DO NOT include BPM or any tempo numbers in the title. Focus on the mood, style, and character of the sound. ` +
+              `Reply with ONLY the title text, nothing else — no quotes, no explanation.`
+            );
+
+            const keywords = await callOllama(
+              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `List 15 relevant SINGLE-WORD keywords. Each must be one word only — no spaces, no hyphens. ` +
+              `Focus on: audio style, genre, mood, instruments, emotions. ` +
+              `Reply with ONLY a single comma-separated line of keywords, nothing else.`
+            );
+
+            const category = await callOllama(
+              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Choose the most appropriate category from this exact list: ${VALID_RT_CATS.join(', ')}\n` +
+              `Reply with ONLY the category name exactly as listed above, nothing else.`
+            );
+
+            const description = await callOllama(
+              `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
+              `Write a SHORT description in MAXIMUM 5 WORDS capturing the mood/style. ` +
+              `Example: "calm piano lofi beats" or "energetic hip hop groove". ` +
+              `Reply with ONLY the 5 words or fewer, nothing else.`
+            );
 
             const cleanedTags = keywords
               .split(',')
@@ -319,7 +254,7 @@ jobs:
 
             const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
             return {
-              title: title.replace(/^["']|["']$/g, '').slice(0, 30),
+              title: title.replace(/^["']|["']$/g, '').trim().split('\n')[0].slice(0, 30),
               tags: cleanedTags,
               category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
               description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
