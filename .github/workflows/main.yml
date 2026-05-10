@@ -58,6 +58,15 @@ on:
         required: false
         default: ""
 
+      use_local_gemma:
+        description: "🦙 Use Local Gemma 4 via Ollama (No API limits, runs natively on runner!)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
 jobs:
   generate-ringtones:
     name: 🎵 Generate & Push Ringtones to Firebase
@@ -68,6 +77,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: 🦙 Install & Start Local Ollama (Gemma 4)
+        if: ${{ github.event.inputs.use_local_gemma == 'true' }}
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 10
+          echo "Pulling gemma4:e2b..."
+          ollama pull gemma4:e2b
 
       - name: 📥 Install Dependencies
         run: |
@@ -88,6 +106,7 @@ jobs:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
+          USE_LOCAL_GEMMA: ${{ github.event.inputs.use_local_gemma }}
           PROMPTS_SECRET: ${{ secrets.PROMPTS }}
           PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
@@ -107,6 +126,8 @@ jobs:
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
           const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
+          const USE_LOCAL_GEMMA      = process.env.USE_LOCAL_GEMMA === 'true';
+          const OLLAMA_URL           = USE_LOCAL_GEMMA ? 'http://localhost:11434' : '';
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
           const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
@@ -142,8 +163,8 @@ jobs:
             .map(k => k.trim())
             .filter(k => k.length > 10);
 
-          if (!GEMINI_KEYS.length) {
-            console.error('❌ GEMINI_API_KEYS secret not set. Add one Gemini API key per line in Repo → Settings → Secrets → Actions');
+          if (!GEMINI_KEYS.length && !OLLAMA_URL) {
+            console.error('❌ Neither GEMINI_API_KEYS nor OLLAMA_URL is set. Please provide at least one.');
             process.exit(1);
           }
 
@@ -185,6 +206,33 @@ jobs:
           const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
           async function callGemini(promptText, retries = 3) {
+            // Route to Ollama if URL is provided
+            if (OLLAMA_URL) {
+              for (let attempt = 1; attempt <= retries; attempt++) {
+                try {
+                  const res = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      model: 'gemma4:e2b',
+                      messages: [{ role: 'user', content: promptText }],
+                      temperature: 1,
+                      top_p: 0.95,
+                      max_tokens: 1024
+                    })
+                  });
+                  if (!res.ok) throw new Error(`Ollama error (${res.status}): ${await res.text()}`);
+                  const data = await res.json();
+                  return data.choices[0].message.content.trim();
+                } catch (e) {
+                  if (attempt >= retries) throw e;
+                  console.warn(`  ⚠️ Ollama attempt ${attempt} failed: ${e.message}. Retrying...`);
+                  await sleep(2000);
+                }
+              }
+            }
+
+            // Fallback to Gemini if no Ollama URL
             for (let attempt = 1; attempt <= retries; attempt++) {
               const apiKey = getNextGeminiKey();
               try {
