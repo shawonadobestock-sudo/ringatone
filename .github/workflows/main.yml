@@ -854,9 +854,16 @@ jobs:
           // ─── UTILITY ──────────────────────────────────────────────────────────────
           function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-          function randomName(ext = '.mp3') {
+          function generateFilename(title) {
             const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + ext;
+            const hash = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+            if (!title) {
+              return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + '.mp3';
+            }
+            let slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+            if (slug.length > 40) slug = slug.substring(0, 40).replace(/-$/, '');
+            if (!slug) slug = 'ringtone';
+            return `${slug}-${hash}.mp3`;
           }
 
           // ─── GENERATE ONE UNIQUE RINGTONE FOR A SINGLE DB ─────────────────────────
@@ -895,7 +902,7 @@ jobs:
 
             // Step D: Push to this specific DB only
             const fileBase64 = `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`;
-            const fileName = randomName('.mp3');
+            const fileName = generateFilename(meta.title);
             const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
               name: fileName,
               type: 'audio/mpeg',
