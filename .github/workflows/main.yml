@@ -130,6 +130,60 @@ jobs:
             process.exit(1);
           }
 
+          let geminiBrowser = null;
+          let geminiPage = null;
+
+          async function initGemini() {
+            console.log('🌐 Starting Gemini Shared Browser...');
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
+
+            geminiBrowser = await chromium.launch({
+              headless: false,  // Xvfb display
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                     '--disable-blink-features=AutomationControlled']
+            });
+
+            const context = await geminiBrowser.newContext({
+              storageState: GEMINI_STORAGE_STATE,
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              viewport: { width: 1280, height: 800 }
+            });
+
+            geminiPage = await context.newPage();
+            console.log('🌐 Loading gemini.google.com/app/new ...');
+            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(3000);
+
+            // Dismiss any potential introductory overlays / cookie banners
+            const dismissSels = [
+              'button:has-text("I agree")',
+              'button:has-text("Agree")',
+              'button:has-text("Got it")',
+              'button:has-text("Dismiss")',
+              'button:has-text("Close")',
+              'button:has-text("OK")'
+            ];
+            for (const sel of dismissSels) {
+              try {
+                if (await geminiPage.isVisible(sel)) {
+                  await geminiPage.click(sel);
+                  console.log(`  🧹 Dismissed overlay: ${sel}`);
+                  await sleep(1000);
+                }
+              } catch (e) {}
+            }
+
+            // Verify logged in
+            const inputVisible = await geminiPage.isVisible('div.ql-editor[contenteditable="true"]').catch(() => false);
+            if (!inputVisible) {
+              console.warn('  ⚠️ Gemini session may be expired — input not found. Check GEMINI_SESSION secret.');
+              throw new Error('Gemini web: input not found — session likely expired');
+            }
+            console.log('  ✅ Gemini web session active and initialized!');
+          }
+
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           const FIREBASE_DB_MAP = {
             zedge_1: 'https://zedgeautomation-default-rtdb.firebaseio.com',
@@ -200,34 +254,53 @@ jobs:
                 document.querySelectorAll('div.response-footer.complete').length
               );
 
-              // Click input and type prompt
+              // Click input and enter prompt
               const inputSel = 'div.ql-editor[contenteditable="true"]';
               await geminiPage.waitForSelector(inputSel, { timeout: 15000 });
               await geminiPage.click(inputSel);
 
-              // Clear any existing text (Ctrl+A then type)
+              // Select all and delete (clear any legacy text)
               await geminiPage.keyboard.press('Control+a');
-              await sleep(100);
-              // Type character by character to avoid QuillJS issues
-              await geminiPage.keyboard.type(prompt, { delay: 5 });
-              await sleep(400);
+              await geminiPage.keyboard.press('Delete');
+              await sleep(150);
 
-              // Click send button
+              // Instantly paste text via Playwright's insertText - ultra-fast and reliable!
+              await geminiPage.keyboard.insertText(prompt);
+              await sleep(300);
+
+              // Select send button
               const sendSel = 'button[aria-label="Send message"]';
               await geminiPage.waitForSelector(sendSel, { timeout: 10000 });
+
+              // If send button is disabled, try to type a space to trigger change handlers
+              const isDisabled = await geminiPage.getAttribute(sendSel, 'disabled').catch(() => null);
+              if (isDisabled !== null) {
+                await geminiPage.keyboard.type(' ');
+                await sleep(200);
+              }
+
+              // Click send
               await geminiPage.click(sendSel);
 
-              // Wait for a NEW response-footer.complete to appear
-              // This class is added EXACTLY when streaming finishes — confirmed from DOM
+              // Wait for completion (either more complete footers or Send button enabled again)
               const deadline = Date.now() + 90000;
               let responseText = '';
               while (Date.now() < deadline) {
                 await sleep(1500);
+
                 const doneCount = await geminiPage.evaluate(() =>
                   document.querySelectorAll('div.response-footer.complete').length
                 );
-                if (doneCount > prevDoneCount) {
-                  // New response is complete — extract the LAST response text
+
+                const sendBtnEnabled = await geminiPage.evaluate(() => {
+                  const btn = document.querySelector('button[aria-label="Send message"]');
+                  return btn && !btn.hasAttribute('disabled') && window.getComputedStyle(btn).display !== 'none';
+                }).catch(() => false);
+
+                if (doneCount > prevDoneCount || sendBtnEnabled) {
+                  // Wait a brief moment to let last rendering finish
+                  await sleep(1000);
+                  // Extract the LAST response text
                   responseText = await geminiPage.evaluate(() => {
                     const allDivs = document.querySelectorAll('div[id^="model-response-message-content"]');
                     const last = allDivs[allDivs.length - 1];
@@ -242,7 +315,7 @@ jobs:
               }
               console.log(`    ✅ [Web ${i+1}] Got response (${responseText.length} chars)`);
               responses.push(responseText);
-              await sleep(800); // Brief pause between prompts
+              await sleep(1000); // Brief pause between sequential prompts
             }
             return responses;
           }
@@ -255,9 +328,73 @@ jobs:
             'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
           ];
 
+          // ─── GEMINI RESPONSE CLEANERS ──────────────────────────────────────────────
+          function cleanTitle(raw) {
+            if (!raw) return '';
+            // Look for quoted text
+            const quoteMatch = raw.match(/"([^"\r\n]{3,60})"/);
+            if (quoteMatch) return quoteMatch[1].trim();
+
+            // Look for bold text
+            const boldMatch = raw.match(/\*\*([^\*\r\n]{3,60})\*\*/);
+            if (boldMatch) return boldMatch[1].trim();
+
+            // Split by lines and filter out conversational fillers
+            const lines = raw.split('\n')
+              .map(l => l.trim())
+              .filter(l => {
+                const lower = l.toLowerCase();
+                return l.length > 0 &&
+                       !lower.startsWith('here') &&
+                       !lower.startsWith('sure') &&
+                       !lower.startsWith('based') &&
+                       !lower.startsWith('suggest') &&
+                       !lower.startsWith('this');
+              });
+
+            if (lines.length > 0) {
+              return lines[0].replace(/^["'*\s]+|["'*\s]+$/g, '').trim().slice(0, 30);
+            }
+            return raw.replace(/^["'*\s]+|["'*\s]+$/g, '').slice(0, 30).trim();
+          }
+
+          function cleanKeywords(raw) {
+            if (!raw) return '';
+            const words = raw.match(/[a-zA-Z0-9]{2,20}/g) || [];
+            const stopWords = new Set(['here', 'are', 'the', 'keywords', 'based', 'on', 'this', 'prompt', 'and', 'for', 'with', 'your', 'ringtone', 'title', 'tags', 'single', 'word']);
+            const uniqueWords = [...new Set(
+              words
+                .map(w => w.trim())
+                .filter(w => {
+                  const lower = w.toLowerCase();
+                  return w.length > 1 && !stopWords.has(lower);
+                })
+            )];
+            return uniqueWords.slice(0, 10).join(', ');
+          }
+
+          function cleanCategory(raw) {
+            if (!raw) return 'OTHER';
+            const upper = raw.toUpperCase();
+            for (const cat of VALID_RT_CATS) {
+              if (upper.includes(cat)) {
+                return cat;
+              }
+            }
+            return 'OTHER';
+          }
+
+          // Write a SHORT description of this ringtone in MAXIMUM 5 WORDS.
+          function cleanDescription(raw) {
+            if (!raw) return '';
+            const quoteMatch = raw.match(/"([^"\r\n]{3,100})"/);
+            let text = quoteMatch ? quoteMatch[1] : raw;
+            text = text.replace(/^(here is a short description:|description:)/i, '').trim();
+            const words = text.split(/\s+/).filter(Boolean);
+            return words.slice(0, 5).join(' ');
+          }
+
           // ─── METADATA GENERATION ───────────────────────────────────────────────────
-          // Web mode: opens ONE browser, sends 4 prompts sequentially (fast, no re-login)
-          // API mode: sends 4 prompts in parallel (original behaviour)
           async function generateMetadataFromPrompt(prompt) {
             console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
 
@@ -281,62 +418,31 @@ jobs:
               `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
               `Return ONLY the short description, nothing else.`;
 
-            // ── WEB MODE: 1 browser, 4 sequential prompts in one chat session ─────
-            const { chromium } = await import('playwright-extra');
-            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
-            chromium.use(StealthPlugin());
-
-            const browser = await chromium.launch({
-              headless: false,  // Xvfb virtual display
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                     '--disable-blink-features=AutomationControlled']
-            });
-            let title, keywords, category, description;
-            try {
-              const context = await browser.newContext({
-                storageState: GEMINI_STORAGE_STATE,
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                viewport: { width: 1280, height: 800 }
-              });
-              const page = await context.newPage();
-
-              // Navigate to a NEW Gemini chat (avoids context bleed between prompts/runs)
-              console.log('  🌐 Loading gemini.google.com/app/new ...');
-              await page.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
-              await sleep(3000);
-
-              // Verify logged in — check for the QuillJS input
-              const inputVisible = await page.isVisible('div.ql-editor[contenteditable="true"]').catch(() => false);
-              if (!inputVisible) {
-                console.warn('  ⚠️ Gemini session may be expired — input not found. Check GEMINI_SESSION secret.');
-                throw new Error('Gemini web: input not found — session likely expired');
-              }
-              console.log('  ✅ Gemini web session active!');
-
-              // Send all 4 prompts sequentially in ONE chat
-              const [r0, r1, r2, r3] = await callGeminiWeb(
-                [TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
-                page
-              );
-              title = r0; keywords = r1; category = r2; description = r3;
-
-            } finally {
-              await browser.close().catch(() => {});
+            if (!geminiPage) {
+              throw new Error('Gemini page is not initialized!');
             }
 
-            const cleanedTags = keywords
-              .split(',')
-              .map(k => k.replace(/[^a-zA-Z0-9]/g, ''))
-              .filter(k => k && k.length > 0 && k.length <= 24)
-              .slice(0, 10)
-              .join(', ');
+            // Reset to a fresh chat for every new metadata prompt sequence
+            console.log('  🌐 Resetting to a fresh Gemini chat...');
+            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(2000);
 
-            const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
+            // Send all 4 prompts sequentially in ONE chat session
+            const [r0, r1, r2, r3] = await callGeminiWeb(
+              [TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+              geminiPage
+            );
+
+            const finalTitle = cleanTitle(r0);
+            const finalTags = cleanKeywords(r1);
+            const finalCategory = cleanCategory(r2);
+            const finalDesc = cleanDescription(r3);
+
             return {
-              title: title.replace(/^["']|["']$/g, '').slice(0, 30),
-              tags: cleanedTags,
-              category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
-              description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
+              title: finalTitle,
+              tags: finalTags,
+              category: finalCategory,
+              description: finalDesc
             };
           }
 
@@ -689,10 +795,10 @@ jobs:
               const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
               const filterComplex = [
                 // Trim silence from start (stop_periods=0 means only trim start)
-                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_duration=${padSec}`,
                 // Trim silence from end (by reversing, trimming, reversing back)
                 `areverse`,
-                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_duration=${padSec}`,
                 `areverse`,
                 // Apply volume boost
                 `volume=${gainFactor}`
@@ -864,6 +970,14 @@ jobs:
             console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           }
 
+          // Initialize Gemini Shared Browser
+          try {
+            await initGemini();
+          } catch (geminiErr) {
+            console.error(`❌ Failed to initialize Gemini browser: ${geminiErr.message}`);
+            process.exit(1);
+          }
+
           // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
           let successCount = 0;
           let failedCount = 0;
@@ -895,6 +1009,12 @@ jobs:
                 await sleep(5000);
               }
             }
+          }
+
+          // ─── SHUTDOWN ─────────────────────────────────────────────────────────────
+          if (geminiBrowser) {
+            console.log('🌐 Closing Gemini Shared Browser...');
+            await geminiBrowser.close().catch(() => {});
           }
 
           // ─── SUMMARY ──────────────────────────────────────────────────────────────
