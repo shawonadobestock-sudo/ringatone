@@ -317,6 +317,9 @@ jobs:
           // ─── GEMINI RESPONSE CLEANERS ──────────────────────────────────────────────
           function cleanTitle(raw) {
             if (!raw) return '';
+            // Remove common conversational prefixes
+            raw = raw.replace(/^(here is a title:|title:|the title is:|suggested title:)/i, '').trim();
+
             // Look for quoted text
             const quoteMatch = raw.match(/"([^"\r\n]{3,60})"/);
             if (quoteMatch) return quoteMatch[1].trim();
@@ -335,6 +338,7 @@ jobs:
                        !lower.startsWith('sure') &&
                        !lower.startsWith('based') &&
                        !lower.startsWith('suggest') &&
+                       !lower.startsWith('the') &&
                        !lower.startsWith('this');
               });
 
@@ -384,51 +388,48 @@ jobs:
           async function generateMetadataFromPrompt(prompt) {
             console.log(`  🤖 Generating enhanced metadata...`);
 
-            const seedList = [
-              'acoustic guitar', 'heavy synth', 'cinematic orchestra', '8-bit chiptune', 'smooth jazz', 'hard rock', 'soft ambient', 'tribal drums', 'experimental noise', 'vocal choir', 'lofi beats', 'funk bass',
-              'synthwave', 'cyberpunk', 'trap beat', 'drill', 'classical piano', 'orchestral brass', 'celtic harp', 'reggae dub', 'salsa', 'bossa nova', 'flamenco', 'bluegrass', 'country twang',
-              'edm drop', 'dubstep wobble', 'house groove', 'techno pulse', 'trance pad', 'ambient drone', 'meditation bowl', 'nature sounds', 'industrial crunch', 'glitch hop', 'synthpop',
-              'rnb slow jam', 'neo soul', 'gospel organ', 'punk rock', 'metal breakdown', 'djent', 'math rock', 'shoegaze', 'dream pop', 'indie folk', 'synth brass', 'marching band', 'ragtime piano',
-              'saxophone solo', 'muted trumpet', 'electric violin', 'cello suite', 'slap bass', 'fretless bass', 'moog synthesizer', 'mellotron', 'hammond organ', 'wurlitzer', 'rhodes piano',
-              'kalimba', 'marimba', 'steel pan', 'vibraphone', 'xylophone', 'glockenspiel', 'music box', 'theremin', 'didgeridoo', 'sitar', 'tabla', 'taiko drums', 'djembe', 'bongos', 'congas',
-              'beatbox', 'acapella', 'kazoo', 'harmonica', 'accordion', 'banjo', 'mandolin', 'ukulele', 'koto', 'shamisen', 'guzheng', 'erhu', 'bagpipes', 'hurdy-gurdy', 'ocarina', 'pan flute',
-              'dark and ominous', 'bright and cheerful', 'melancholic', 'nostalgic', 'energetic', 'calm and relaxing', 'spooky', 'ethereal', 'majestic', 'epic', 'whimsical', 'quirky', 'mysterious',
-              'distorted', 'clean and crisp', 'lo-fi vinyl', 'tape saturation', 'reverb drenched', 'dry and punchy', 'fast and frantic', 'slow and dragging', 'syncopated', 'polyrhythmic'
-            ];
-            const randomInspirations = seedList.sort(() => 0.5 - Math.random()).slice(0, 6).join(', ');
+            const genres = ['Classical', 'Jazz', 'Acoustic Folk', 'Heavy Metal', 'Country', 'Reggae', 'Blues', 'Latin', 'Bollywood', 'Cinematic Orchestral', 'World Music', 'Celtic Harp', 'Tribal Percussion', 'Soul', 'Funk', 'Opera', 'Bluegrass', 'Flamenco', 'Bossa Nova', 'Salsa', 'Griot', 'Ambient Nature', 'Medieval', 'Renaissance', 'Baroque'];
+            const instruments = ['Grand Piano', 'Violin', 'Trumpet', 'Saxophone', 'Cello', 'Acoustic Guitar', 'Sitar', 'Banjo', 'Ukulele', 'Accordion', 'Harmonica', 'Flute', 'Djembe Drums', 'Music Box', 'Marimba', 'Kalimba', 'Bagpipes', 'Steel Pan', 'Harp', 'Didgeridoo', 'Koto', 'Ocarina', 'Lute', 'Tambourine'];
+            const moods = ['Peaceful', 'Energetic', 'Mysterious', 'Joyful', 'Melancholic', 'Heroic', 'Whimsical', 'Dark', 'Bright', 'Epic', 'Spooky', 'Nostalgic', 'Rustic', 'Celestial', 'Primal', 'Graceful'];
+
+            const randomGenre = genres[Math.floor(Math.random() * genres.length)];
+            const randomInstrument = instruments[Math.floor(Math.random() * instruments.length)];
+            const randomMood = moods[Math.floor(Math.random() * moods.length)];
+            const randomSalt = Math.random().toString(36).substring(7);
+
+            const BANNED_WORDS = 'Glitched, Echo, Electronic, Digital, Lo-fi, Synth, Pulse, Wave, Bass, Trap, Chill, Cool, Awesome, Ringtone, Beat, Sound, Vibe, Remix, DJ, Techno, EDM';
 
             const ENHANCE_PROMPT = prompt 
-              ? `I want to generate an AI audio track based on this simple idea: "${prompt}".\n` +
-                `Please rewrite this into a highly detailed, extremely creative, and completely unique text-to-music prompt (max 30 words). ` +
-                `Focus on specific instruments, mood, tempo, and texture to ensure the audio generator produces something entirely unique. ` +
-                `IMPORTANT: Avoid repetitive structures or cliches. Make it as distinct as possible. ` +
-                `Return ONLY the enhanced prompt, nothing else.`
-              : `You are an expert audio designer. Generate a completely random, highly creative, and entirely unique text-to-music prompt (max 30 words) for a ringtone. ` +
-                `To ensure extreme variety, use these as loose inspiration: ${randomInspirations}. ` +
-                `CRITICAL: Every prompt must sound drastically different from typical ringtones. Avoid repetitive words. Focus on specific unusual instruments, distinct moods, unexpected tempos, and unique textures. ` +
+              ? `I want to generate an AI audio track based on this idea: "${prompt}".\n` +
+                `Rewrite this into a detailed 30-word text-to-music prompt. Focus on organic instruments and avoid all electronic cliches. [Salt: ${randomSalt}]`
+              : `You are an expert audio designer. Generate a completely unique text-to-music prompt (max 30 words) for a ringtone.\n\n` +
+                `MANDATORY THEME: Style: ${randomGenre} | Lead: ${randomInstrument} | Mood: ${randomMood}\n\n` +
+                `CRITICAL: DO NOT use "glitched", "echo", or any electronic terms. Focus on REAL-WORLD sounds and authentic organic instruments. ` +
+                `[Random Salt: ${randomSalt}]\n` +
                 `Return ONLY the generated prompt, nothing else.`;
 
-            const TITLE_PROMPT = `Based on the audio you just described, ` +
-              `generate a creative, catchy, and UNIQUE title that is naturally around 20 characters long. ` +
-              `IMPORTANT: DO NOT include BPM, tempo numbers, or generic words like "Ringtone", "Beat", "Sound", or "Vibe". Focus on the specific mood, style, and unique character of the sound. ` +
-              `Ensure the title is highly distinctive and not similar to other generic titles. ` +
-              `Only provide the title itself, no quotes, no extra text or instructions.`;
+            const TITLE_PROMPT = `Based on the audio you just described, generate a creative, catchy, and UNIQUE title (max 25 characters).\n\n` +
+              `CRITICAL - DO NOT USE THESE WORDS: ${BANNED_WORDS}\n\n` +
+              `Instructions:\n` +
+              `1. DO NOT use generic musical terms.\n` +
+              `2. Use evocative, descriptive imagery (e.g., "Silver Brook", "Ancient Stone", "Mist on Hills").\n` +
+              `3. Ensure the title is completely distinct and not repetitive.\n` +
+              `Return ONLY the title, no quotes, no extra text.`;
 
             const KEYWORDS_PROMPT = `Based on the audio you just described, ` +
-              `extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
-              `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
-              `Present keywords in a single comma-separated line without punctuation or full stops.`;
+              `extract 15 relevant, descriptive SINGLE-WORD keywords. Each keyword MUST be a single word. ` +
+              `Focus on: genre, mood, instruments, emotions. Avoid all electronic/digital terms. ` +
+              `Present keywords in a single comma-separated line.`;
 
             const validCategories = VALID_RT_CATS.filter(c => c !== 'OTHER').join(', ');
             const CATEGORY_PROMPT = `Based on the audio you just described, ` +
-              `analyze and select the most appropriate category from this exact list. ` +
-              `Return only the category name exactly as shown, nothing else: ${validCategories}`;
+              `analyze and select the most appropriate category from this list: ${validCategories}\n` +
+              `Return ONLY the category name.`;
 
             const DESC_PROMPT = `Based on the audio you just described, ` +
-              `write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
-              `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
-              `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
-              `Return ONLY the short description, nothing else.`;
+              `write a SHORT description in MAXIMUM 5 WORDS. ` +
+              `No punctuation, no sentences. Capture the soul of the sound.\n` +
+              `Return ONLY the description.`;
 
             if (!geminiPage) {
               throw new Error('Gemini page is not initialized!');
