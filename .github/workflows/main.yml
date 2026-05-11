@@ -3,15 +3,10 @@ name: ☁️ Bulk Ringtone Generator → Firebase
 on:
   workflow_dispatch:
     inputs:
-      prompts:
-        description: |
-          🎵 Music Prompts (one per line) — leave blank to use PROMPTS secret
-          Example:
-            Piano sad emotional melody ambient pad 80 bpm
-            Energetic upbeat dance electronic 128 bpm
-        required: false
-        default: ""
-        type: string
+      auto_generate_count:
+        description: "🤖 Auto-generate N ringtones (0 to disable)"
+        required: true
+        default: "10"
 
       length_seconds:
         description: "⏱️ Duration per ringtone (seconds, e.g. 5)"
@@ -53,8 +48,8 @@ on:
           - zedge_3
           - all_three
 
-      gemini_api_keys:
-        description: "🤖 Gemini API Keys (one per line — overrides secret if filled)"
+      gemini_session:
+        description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
         required: false
         default: ""
 
@@ -86,10 +81,9 @@ jobs:
       - name: 🎵 Generate Ringtones & Push to Firebase
         env:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
-          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
-          GEMINI_API_KEYS_INPUT: ${{ github.event.inputs.gemini_api_keys }}
-          PROMPTS_SECRET: ${{ secrets.PROMPTS }}
-          PROMPTS_INPUT: ${{ github.event.inputs.prompts }}
+          GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
+          GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
+          AUTO_GENERATE_COUNT: ${{ github.event.inputs.auto_generate_count }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
           LENGTH_SECONDS: ${{ github.event.inputs.length_seconds }}
           AUTO_PROCESS: ${{ github.event.inputs.auto_process }}
@@ -106,15 +100,83 @@ jobs:
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
-          const GEMINI_KEYS_RAW      = (process.env.GEMINI_API_KEYS_INPUT?.trim() || process.env.GEMINI_API_KEYS || '');
+          const GEMINI_SESSION_RAW   = (process.env.GEMINI_SESSION_INPUT?.trim() || process.env.GEMINI_SESSION || '').trim();
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
-          const PROMPTS_RAW = (process.env.PROMPTS_INPUT?.trim() || process.env.PROMPTS_SECRET || '').trim();
+          const AUTO_GENERATE_COUNT  = parseInt(process.env.AUTO_GENERATE_COUNT || '10', 10);
           const LENGTH_SECONDS       = parseInt(process.env.LENGTH_SECONDS || '30', 10);
           const AUTO_PROCESS         = process.env.AUTO_PROCESS !== 'false';
           const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
           const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
           const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
+
+          // Parse Gemini session
+          if (!GEMINI_SESSION_RAW) {
+            console.error('❌ Error: GEMINI_SESSION secret or input is missing. Direct Gemini Web Session is required.');
+            process.exit(1);
+          }
+          let GEMINI_STORAGE_STATE = null;
+          try {
+            GEMINI_STORAGE_STATE = JSON.parse(GEMINI_SESSION_RAW);
+            console.log('🌐 Gemini Web Session loaded successfully (no API key needed!)');
+          } catch (e) {
+            console.error('❌ Error: GEMINI_SESSION is not valid JSON. Please check your storageState JSON export.');
+            process.exit(1);
+          }
+
+          let geminiBrowser = null;
+          let geminiPage = null;
+
+          async function initGemini() {
+            console.log('🌐 Starting Gemini Shared Browser...');
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
+
+            geminiBrowser = await chromium.launch({
+              headless: false,  // Xvfb display
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                     '--disable-blink-features=AutomationControlled']
+            });
+
+            const context = await geminiBrowser.newContext({
+              storageState: GEMINI_STORAGE_STATE,
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              viewport: { width: 1280, height: 800 }
+            });
+
+            geminiPage = await context.newPage();
+            console.log('🌐 Loading gemini.google.com/app/new ...');
+            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(3000);
+
+            // Dismiss any potential introductory overlays / cookie banners
+            const dismissSels = [
+              'button:has-text("I agree")',
+              'button:has-text("Agree")',
+              'button:has-text("Got it")',
+              'button:has-text("Dismiss")',
+              'button:has-text("Close")',
+              'button:has-text("OK")'
+            ];
+            for (const sel of dismissSels) {
+              try {
+                if (await geminiPage.isVisible(sel)) {
+                  await geminiPage.click(sel);
+                  console.log(`  🧹 Dismissed overlay: ${sel}`);
+                  await sleep(1000);
+                }
+              } catch (e) {}
+            }
+
+            // Verify logged in
+            const inputVisible = await geminiPage.isVisible('div.ql-editor[contenteditable="true"]').catch(() => false);
+            if (!inputVisible) {
+              console.warn('  ⚠️ Gemini session may be expired — input not found. Check GEMINI_SESSION secret.');
+              throw new Error('Gemini web: input not found — session likely expired');
+            }
+            console.log('  ✅ Gemini web session active and initialized!');
+          }
 
           // ─── FIREBASE DB ROUTING ──────────────────────────────────────────────────
           const FIREBASE_DB_MAP = {
@@ -137,30 +199,14 @@ jobs:
           // ─── VALIDATION ────────────────────────────────────────────────────────────
           // Note: STABLE_AUDIO_TOKEN is OPTIONAL — if empty, account is auto-created at startup
 
-          const GEMINI_KEYS = GEMINI_KEYS_RAW
-            .split(/[\n,]+/)
-            .map(k => k.trim())
-            .filter(k => k.length > 10);
 
-          if (!GEMINI_KEYS.length) {
-            console.error('❌ GEMINI_API_KEYS secret not set. Add one Gemini API key per line in Repo → Settings → Secrets → Actions');
-            process.exit(1);
-          }
 
-          const PROMPTS = PROMPTS_RAW
-            .split('\n')
-            .map(p => p.trim())
-            .filter(Boolean);
-
-          if (!PROMPTS.length) {
-            console.error('❌ No prompts found. Enter at least one prompt in the workflow input.');
-            process.exit(1);
-          }
+          let PROMPTS = [];
 
           console.log('============================================================');
           console.log('  ☁️  BULK RINGTONE GENERATOR → FIREBASE');
           console.log('============================================================');
-          console.log(`📋 Prompts: ${PROMPTS.length}`);
+          console.log(`📋 Auto-Generating: ${AUTO_GENERATE_COUNT} unique ringtones`);
           console.log(`⏱️  Duration: ${LENGTH_SECONDS}s per ringtone`);
           console.log(`🎛️  Auto-process: ${AUTO_PROCESS ? 'Yes' : 'No'}`);
           if (AUTO_PROCESS) {
@@ -171,56 +217,93 @@ jobs:
           console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
           TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
           console.log(`📂 Queue Path: ${QUEUE_PATH}`);
-          console.log(`🤖 Gemini Keys: ${GEMINI_KEYS.length}`);
+          console.log(`🌐 Gemini Mode : Web scraping (gemini.google.com) — direct session!`);
           console.log('============================================================\n');
 
-          // ─── GEMINI KEY ROTATION ───────────────────────────────────────────────────
-          let _geminiKeyIdx = 0;
-          function getNextGeminiKey() {
-            const key = GEMINI_KEYS[_geminiKeyIdx % GEMINI_KEYS.length];
-            _geminiKeyIdx = (_geminiKeyIdx + 1) % GEMINI_KEYS.length;
-            return key;
-          }
+          // ─── GEMINI VIA WEB SCRAPING (uses saved Google session) ───────────────────
+          // Uses confirmed DOM selectors from live gemini.google.com HTML:
+          //   Input  : div.ql-editor[contenteditable="true"]  (QuillJS editor)
+          //   Send   : button[aria-label="Send message"]
+          //   Done   : div.response-footer.complete  ← CSS class added when streaming ends
+          //   Text   : div[id^="model-response-message-content"]
+          async function callGeminiWeb(promptTexts, geminiPage) {
+            // promptTexts is an array — we send them all in sequence in one chat session
+            // Returns array of response strings, one per prompt
+            const responses = [];
 
-          const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+            for (let i = 0; i < promptTexts.length; i++) {
+              const prompt = promptTexts[i];
+              console.log(`    🌐 [Web ${i+1}/${promptTexts.length}] Sending prompt (${prompt.length} chars)...`);
 
-          async function callGemini(promptText, retries = 3) {
-            for (let attempt = 1; attempt <= retries; attempt++) {
-              const apiKey = getNextGeminiKey();
-              try {
-                const res = await fetch(
-                  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-                  {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-                    body: JSON.stringify({
-                      contents: [{ parts: [{ text: promptText }] }],
-                      generationConfig: { temperature: 1, topP: 0.95, topK: 40, maxOutputTokens: 1024 }
-                    })
-                  }
-                );
-                if (!res.ok) {
-                  const err = await res.text();
-                  if (res.status === 429) {
-                    console.warn(`  ⚠️ Gemini rate limit (429) hit. Waiting 1 minute before retrying...`);
-                    await sleep(60000);
-                    attempt--; // Do not count rate limits against max retries
-                    continue;
-                  }
-                  if (attempt < retries) {
-                    console.warn(`  ⚠️ Gemini attempt ${attempt} failed (${res.status}). Retrying with next key...`);
-                    await sleep(2000);
-                    continue;
-                  }
-                  throw new Error(`Gemini error (${res.status}): ${err.slice(0, 200)}`);
-                }
-                const data = await res.json();
-                return data.candidates[0].content.parts.map(p => p.text).join('').trim();
-              } catch (e) {
-                if (attempt >= retries) throw e;
-                await sleep(2000);
+              // Count existing response-footer.complete divs before sending
+              const prevDoneCount = await geminiPage.evaluate(() =>
+                document.querySelectorAll('div.response-footer.complete').length
+              );
+
+              // Click input and enter prompt
+              const inputSel = 'div.ql-editor[contenteditable="true"]';
+              await geminiPage.waitForSelector(inputSel, { timeout: 15000 });
+              await geminiPage.click(inputSel);
+
+              // Select all and delete (clear any legacy text)
+              await geminiPage.keyboard.press('Control+a');
+              await geminiPage.keyboard.press('Delete');
+              await sleep(150);
+
+              // Instantly paste text via Playwright's insertText - ultra-fast and reliable!
+              await geminiPage.keyboard.insertText(prompt);
+              await sleep(300);
+
+              // Select send button
+              const sendSel = 'button[aria-label="Send message"]';
+              await geminiPage.waitForSelector(sendSel, { timeout: 10000 });
+
+              // If send button is disabled, try to type a space to trigger change handlers
+              const isDisabled = await geminiPage.getAttribute(sendSel, 'disabled').catch(() => null);
+              if (isDisabled !== null) {
+                await geminiPage.keyboard.type(' ');
+                await sleep(200);
               }
+
+              // Click send
+              await geminiPage.click(sendSel);
+
+              // Wait for completion (either more complete footers or Send button enabled again)
+              const deadline = Date.now() + 90000;
+              let responseText = '';
+              while (Date.now() < deadline) {
+                await sleep(1500);
+
+                const doneCount = await geminiPage.evaluate(() =>
+                  document.querySelectorAll('div.response-footer.complete').length
+                );
+
+                const sendBtnEnabled = await geminiPage.evaluate(() => {
+                  const btn = document.querySelector('button[aria-label="Send message"]');
+                  return btn && !btn.hasAttribute('disabled') && window.getComputedStyle(btn).display !== 'none';
+                }).catch(() => false);
+
+                if (doneCount > prevDoneCount || sendBtnEnabled) {
+                  // Wait a brief moment to let last rendering finish
+                  await sleep(1000);
+                  // Extract the LAST response text
+                  responseText = await geminiPage.evaluate(() => {
+                    const allDivs = document.querySelectorAll('div[id^="model-response-message-content"]');
+                    const last = allDivs[allDivs.length - 1];
+                    return last ? last.innerText.trim() : '';
+                  });
+                  break;
+                }
+              }
+
+              if (!responseText) {
+                throw new Error(`Gemini web timeout: no response for prompt ${i+1} within 90s`);
+              }
+              console.log(`    ✅ [Web ${i+1}] Got response (${responseText.length} chars)`);
+              responses.push(responseText);
+              await sleep(1000); // Brief pause between sequential prompts
             }
+            return responses;
           }
 
           // ─── VALID RINGTONE CATEGORIES ─────────────────────────────────────────────
@@ -231,85 +314,151 @@ jobs:
             'ELECTRONICA', 'GAMES', 'HIP_HOP', 'HOLIDAYS', 'JAZZ'
           ];
 
-          // ─── METADATA GENERATION (4 parallel Gemini calls) ────────────────────────
+          // ─── GEMINI RESPONSE CLEANERS ──────────────────────────────────────────────
+          function cleanTitle(raw) {
+            if (!raw) return '';
+            // Look for quoted text
+            const quoteMatch = raw.match(/"([^"\r\n]{3,60})"/);
+            if (quoteMatch) return quoteMatch[1].trim();
 
-          // Random title style modifiers to force diverse, non-repetitive titles
-          const TITLE_STYLES = [
-            'Use a metaphor or imagery (e.g. "Velvet Horizon", "Copper Rain").',
-            'Use a place or journey concept (e.g. "Tokyo Drift", "Midnight Boulevard").',
-            'Use an emotion + color combo (e.g. "Crimson Calm", "Golden Ache").',
-            'Use a nature reference (e.g. "Storm Echo", "Petal Fall").',
-            'Use an abstract concept (e.g. "Parallel Drift", "Phantom Signal").',
-            'Use a time-of-day reference (e.g. "Dawn Pulse", "Midnight Haze").',
-            'Use a texture or material (e.g. "Silk Static", "Iron Bloom").',
-            'Use a cosmic or space theme (e.g. "Orbit Fade", "Stellar Pulse").',
-            'Use a retro or nostalgic feel (e.g. "Neon Archive", "Vinyl Haze").',
-            'Use an action or motion (e.g. "Rising Current", "Falling Sparks").',
-            'Use a contrast or duality (e.g. "Soft Thunder", "Frozen Fire").',
-            'Use a minimal 1-2 word punchy name (e.g. "Apex", "Luma", "Drift").',
-          ];
+            // Look for bold text
+            const boldMatch = raw.match(/\*\*([^\*\r\n]{3,60})\*\*/);
+            if (boldMatch) return boldMatch[1].trim();
 
-          let _titleStyleIdx = 0;
-          function getNextTitleStyle() {
-            const style = TITLE_STYLES[_titleStyleIdx % TITLE_STYLES.length];
-            _titleStyleIdx++;
-            return style;
+            // Split by lines and filter out conversational fillers
+            const lines = raw.split('\n')
+              .map(l => l.trim())
+              .filter(l => {
+                const lower = l.toLowerCase();
+                return l.length > 0 &&
+                       !lower.startsWith('here') &&
+                       !lower.startsWith('sure') &&
+                       !lower.startsWith('based') &&
+                       !lower.startsWith('suggest') &&
+                       !lower.startsWith('this');
+              });
+
+            if (lines.length > 0) {
+              return lines[0].replace(/^["'*\s]+|["'*\s]+$/g, '').trim().slice(0, 30);
+            }
+            return raw.replace(/^["'*\s]+|["'*\s]+$/g, '').slice(0, 30).trim();
           }
 
+          function cleanKeywords(raw) {
+            if (!raw) return '';
+            const words = raw.match(/[a-zA-Z0-9]{2,20}/g) || [];
+            const stopWords = new Set(['here', 'are', 'the', 'keywords', 'based', 'on', 'this', 'prompt', 'and', 'for', 'with', 'your', 'ringtone', 'title', 'tags', 'single', 'word']);
+            const uniqueWords = [...new Set(
+              words
+                .map(w => w.trim())
+                .filter(w => {
+                  const lower = w.toLowerCase();
+                  return w.length > 1 && !stopWords.has(lower);
+                })
+            )];
+            return uniqueWords.slice(0, 10).join(', ');
+          }
+
+          function cleanCategory(raw) {
+            if (!raw) return 'OTHER';
+            const upper = raw.toUpperCase();
+            for (const cat of VALID_RT_CATS) {
+              if (upper.includes(cat)) {
+                return cat;
+              }
+            }
+            return 'OTHER';
+          }
+
+          // Write a SHORT description of this ringtone in MAXIMUM 5 WORDS.
+          function cleanDescription(raw) {
+            if (!raw) return '';
+            const quoteMatch = raw.match(/"([^"\r\n]{3,100})"/);
+            let text = quoteMatch ? quoteMatch[1] : raw;
+            text = text.replace(/^(here is a short description:|description:)/i, '').trim();
+            const words = text.split(/\s+/).filter(Boolean);
+            return words.slice(0, 5).join(' ');
+          }
+
+          // ─── METADATA GENERATION ───────────────────────────────────────────────────
           async function generateMetadataFromPrompt(prompt) {
-            console.log(`  🤖 Generating metadata for: "${prompt.slice(0, 60)}..."`);
+            console.log(`  🤖 Generating enhanced metadata...`);
 
-            const titleStyle = getNextTitleStyle();
-            const uniqueSeed = Math.random().toString(36).substring(2, 8); // forces Gemini to think fresh
+            const seedList = [
+              'acoustic guitar', 'heavy synth', 'cinematic orchestra', '8-bit chiptune', 'smooth jazz', 'hard rock', 'soft ambient', 'tribal drums', 'experimental noise', 'vocal choir', 'lofi beats', 'funk bass',
+              'synthwave', 'cyberpunk', 'trap beat', 'drill', 'classical piano', 'orchestral brass', 'celtic harp', 'reggae dub', 'salsa', 'bossa nova', 'flamenco', 'bluegrass', 'country twang',
+              'edm drop', 'dubstep wobble', 'house groove', 'techno pulse', 'trance pad', 'ambient drone', 'meditation bowl', 'nature sounds', 'industrial crunch', 'glitch hop', 'synthpop',
+              'rnb slow jam', 'neo soul', 'gospel organ', 'punk rock', 'metal breakdown', 'djent', 'math rock', 'shoegaze', 'dream pop', 'indie folk', 'synth brass', 'marching band', 'ragtime piano',
+              'saxophone solo', 'muted trumpet', 'electric violin', 'cello suite', 'slap bass', 'fretless bass', 'moog synthesizer', 'mellotron', 'hammond organ', 'wurlitzer', 'rhodes piano',
+              'kalimba', 'marimba', 'steel pan', 'vibraphone', 'xylophone', 'glockenspiel', 'music box', 'theremin', 'didgeridoo', 'sitar', 'tabla', 'taiko drums', 'djembe', 'bongos', 'congas',
+              'beatbox', 'acapella', 'kazoo', 'harmonica', 'accordion', 'banjo', 'mandolin', 'ukulele', 'koto', 'shamisen', 'guzheng', 'erhu', 'bagpipes', 'hurdy-gurdy', 'ocarina', 'pan flute',
+              'dark and ominous', 'bright and cheerful', 'melancholic', 'nostalgic', 'energetic', 'calm and relaxing', 'spooky', 'ethereal', 'majestic', 'epic', 'whimsical', 'quirky', 'mysterious',
+              'distorted', 'clean and crisp', 'lo-fi vinyl', 'tape saturation', 'reverb drenched', 'dry and punchy', 'fast and frantic', 'slow and dragging', 'syncopated', 'polyrhythmic'
+            ];
+            const randomInspirations = seedList.sort(() => 0.5 - Math.random()).slice(0, 6).join(', ');
 
-            const [title, keywords, category, description] = await Promise.all([
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Generate a creative, catchy ringtone title. ` +
-                `Style rule (you MUST follow): ${titleStyle} ` +
-                `The title should be unique, memorable, and around 20-30 characters. ` +
-                `STRICT RULES: ` +
-                `(1) Do NOT use the words: glitch, digital, neon, electronic, electric, beat, beats, rhythm, groove, funk in the title unless they appear nowhere else in this batch. ` +
-                `(2) Do NOT include BPM, tempo numbers, or any numbers. ` +
-                `(3) Do NOT start with the same word as common titles. ` +
-                `(4) Variation key: ${uniqueSeed} — use this to ensure your output is fresh and different. ` +
-                `Return ONLY the title text, nothing else.`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
-                `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
-                `Avoid overused generic words like "glitch", "digital", "electronic" unless highly specific to this sound. ` +
-                `Present keywords in a single comma-separated line without punctuation or full stops.`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Analyze and select the most appropriate category from this exact list. ` +
-                `Return only the category name exactly as shown, nothing else: ${VALID_RT_CATS.join(', ')}`
-              ),
-              callGemini(
-                `Based on this ringtone/audio generation prompt: "${prompt}"\n\n` +
-                `Write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
-                `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
-                `Make it unique and descriptive — avoid generic phrases like "glitch groove" or "digital beat". ` +
-                `Example outputs: "calm piano lofi beats" or "haunting brass dusk melody". ` +
-                `Return ONLY the short description, nothing else.`
-              )
-            ]);
+            const ENHANCE_PROMPT = prompt 
+              ? `I want to generate an AI audio track based on this simple idea: "${prompt}".\n` +
+                `Please rewrite this into a highly detailed, extremely creative, and completely unique text-to-music prompt (max 30 words). ` +
+                `Focus on specific instruments, mood, tempo, and texture to ensure the audio generator produces something entirely unique. ` +
+                `IMPORTANT: Avoid repetitive structures or cliches. Make it as distinct as possible. ` +
+                `Return ONLY the enhanced prompt, nothing else.`
+              : `You are an expert audio designer. Generate a completely random, highly creative, and entirely unique text-to-music prompt (max 30 words) for a ringtone. ` +
+                `To ensure extreme variety, use these as loose inspiration: ${randomInspirations}. ` +
+                `CRITICAL: Every prompt must sound drastically different from typical ringtones. Avoid repetitive words. Focus on specific unusual instruments, distinct moods, unexpected tempos, and unique textures. ` +
+                `Return ONLY the generated prompt, nothing else.`;
 
-            const cleanedTags = keywords
-              .split(',')
-              .map(k => k.replace(/[^a-zA-Z0-9]/g, ''))
-              .filter(k => k && k.length > 0 && k.length <= 24)
-              .slice(0, 10)
-              .join(', ');
+            const TITLE_PROMPT = `Based on the audio you just described, ` +
+              `generate a creative, catchy, and UNIQUE title that is naturally around 20 characters long. ` +
+              `IMPORTANT: DO NOT include BPM, tempo numbers, or generic words like "Ringtone", "Beat", "Sound", or "Vibe". Focus on the specific mood, style, and unique character of the sound. ` +
+              `Ensure the title is highly distinctive and not similar to other generic titles. ` +
+              `Only provide the title itself, no quotes, no extra text or instructions.`;
 
-            const rawCat = (category || '').replace(/[^A-Z_]/g, '').trim().toUpperCase();
+            const KEYWORDS_PROMPT = `Based on the audio you just described, ` +
+              `extract 15 relevant, descriptive SINGLE-WORD keywords. IMPORTANT: Each keyword MUST be a single word only - ` +
+              `NO spaces, NO hyphens, NO multi-word phrases. Focus on: audio style, genre, mood, instruments, emotions, characteristics. ` +
+              `Present keywords in a single comma-separated line without punctuation or full stops.`;
+
+            const validCategories = VALID_RT_CATS.filter(c => c !== 'OTHER').join(', ');
+            const CATEGORY_PROMPT = `Based on the audio you just described, ` +
+              `analyze and select the most appropriate category from this exact list. ` +
+              `Return only the category name exactly as shown, nothing else: ${validCategories}`;
+
+            const DESC_PROMPT = `Based on the audio you just described, ` +
+              `write a SHORT description of this ringtone in MAXIMUM 5 WORDS. ` +
+              `No punctuation, no sentences, just 5 words or fewer that capture the mood/style. ` +
+              `Example outputs: "calm piano lofi beats" or "energetic hip hop groove". ` +
+              `Return ONLY the short description, nothing else.`;
+
+            if (!geminiPage) {
+              throw new Error('Gemini page is not initialized!');
+            }
+
+            // Reset to a fresh chat for every new metadata prompt sequence
+            console.log('  🌐 Resetting to a fresh Gemini chat...');
+            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(2000);
+
+            // Send all 5 prompts sequentially in ONE chat session
+            const [r0, r1, r2, r3, r4] = await callGeminiWeb(
+              [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+              geminiPage
+            );
+
+            const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim() || prompt;
+            const finalTitle = cleanTitle(r1);
+            const finalTags = cleanKeywords(r2);
+            const finalCategory = cleanCategory(r3);
+            const finalDesc = cleanDescription(r4);
+
+            console.log(`  ✨ Enhanced Prompt: "${enhancedPrompt}"`);
+
             return {
-              title: title.replace(/^["']|["']$/g, '').slice(0, 30),
-              tags: cleanedTags,
-              category: VALID_RT_CATS.includes(rawCat) ? rawCat : 'OTHER',
-              description: description.replace(/^["']|["']$/g, '').trim().split(/\s+/).slice(0, 5).join(' ')
+              enhancedPrompt: enhancedPrompt,
+              title: finalTitle,
+              tags: finalTags,
+              category: finalCategory,
+              description: finalDesc
             };
           }
 
@@ -662,10 +811,10 @@ jobs:
               const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
               const filterComplex = [
                 // Trim silence from start (stop_periods=0 means only trim start)
-                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_duration=${padSec}`,
                 // Trim silence from end (by reversing, trimming, reversing back)
                 `areverse`,
-                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_silence=${padSec}`,
+                `silenceremove=start_periods=1:start_threshold=${dbStr}:start_duration=${padSec}`,
                 `areverse`,
                 // Apply volume boost
                 `volume=${gainFactor}`
@@ -725,9 +874,16 @@ jobs:
           // ─── UTILITY ──────────────────────────────────────────────────────────────
           function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-          function randomName(ext = '.mp3') {
+          function generateFilename(title) {
             const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + ext;
+            const hash = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+            if (!title) {
+              return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('') + '.mp3';
+            }
+            let slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
+            if (slug.length > 40) slug = slug.substring(0, 40).replace(/-$/, '');
+            if (!slug) slug = 'ringtone';
+            return `${slug}-${hash}.mp3`;
           }
 
           // ─── GENERATE ONE UNIQUE RINGTONE FOR A SINGLE DB ─────────────────────────
@@ -743,7 +899,8 @@ jobs:
             } catch (e) {
               console.warn(`  ⚠️ [${dbTarget.name}] Metadata failed: ${e.message} — using fallback`);
               meta = {
-                title: prompt.split(' ').slice(0, 4).join(' ').slice(0, 30),
+                enhancedPrompt: prompt || 'electronic synth pulse',
+                title: (prompt || 'Random Ringtone').split(' ').slice(0, 4).join(' ').slice(0, 30),
                 tags: '',
                 category: 'OTHER',
                 description: ''
@@ -751,7 +908,7 @@ jobs:
             }
 
             // Step B: Generate unique audio (each call gets a random seed → different sound)
-            const { resultUrl } = await generateStableAudio(prompt, LENGTH_SECONDS);
+            const { resultUrl } = await generateStableAudio(meta.enhancedPrompt, LENGTH_SECONDS);
             let audioBuffer = await pollStableAudioResult(resultUrl);
 
             // Step C: Optional auto-processing
@@ -765,7 +922,7 @@ jobs:
 
             // Step D: Push to this specific DB only
             const fileBase64 = `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`;
-            const fileName = randomName('.mp3');
+            const fileName = generateFilename(meta.title);
             const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
               name: fileName,
               type: 'audio/mpeg',
@@ -788,9 +945,10 @@ jobs:
 
           // ─── PROCESS A SINGLE PROMPT ───────────────────────────────────────────────
           async function processPrompt(idx, prompt) {
-            const num = `[${idx + 1}/${PROMPTS.length}]`;
+            const num = `[${idx + 1}/${AUTO_GENERATE_COUNT}]`;
             console.log(`\n${num} ─────────────────────────────────────────────`);
-            console.log(`${num} Prompt: "${prompt}"`);
+            if (prompt) console.log(`${num} Prompt: "${prompt}"`);
+            else console.log(`${num} Auto-Generating Random Ringtone...`);
             console.log(`${num} ─────────────────────────────────────────────`);
 
             if (TARGET_DB_URLS.length === 1) {
@@ -837,37 +995,56 @@ jobs:
             console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           }
 
+          // Initialize Gemini Shared Browser
+          try {
+            await initGemini();
+          } catch (geminiErr) {
+            console.error(`❌ Failed to initialize Gemini browser: ${geminiErr.message}`);
+            process.exit(1);
+          }
+
           // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
           let successCount = 0;
           let failedCount = 0;
           const results = [];
 
-          for (let i = 0; i < PROMPTS.length; i++) {
+          if (AUTO_GENERATE_COUNT === 0) {
+            console.log('✅ AUTO_GENERATE_COUNT is 0. Nothing to do.');
+            process.exit(0);
+          }
+
+          for (let i = 0; i < AUTO_GENERATE_COUNT; i++) {
             try {
-              const result = await processPrompt(i, PROMPTS[i]);
-              results.push({ status: 'success', ...result, prompt: PROMPTS[i] });
+              const result = await processPrompt(i, null);
+              results.push({ status: 'success', ...result, prompt: 'Auto-Generated' });
               successCount++;
             } catch (err) {
               console.error(`\n❌ Prompt ${i + 1} FAILED: ${err.message}`);
-              results.push({ status: 'failed', prompt: PROMPTS[i], error: err.message });
+              results.push({ status: 'failed', prompt: 'Auto-Generated', error: err.message });
               failedCount++;
 
               // If API limit is hit, abort remaining prompts
               if (err.message.startsWith('API_LIMIT_REACHED')) {
                 console.error('\n🛑 Aborting: Stable Audio API credits exhausted.');
                 console.error('   Update STABLE_AUDIO_TOKEN secret with a fresh token and re-run.');
-                for (let j = i + 1; j < PROMPTS.length; j++) {
-                  results.push({ status: 'skipped', prompt: PROMPTS[j] });
+                for (let j = i + 1; j < AUTO_GENERATE_COUNT; j++) {
+                  results.push({ status: 'skipped', prompt: 'Auto-Generated' });
                 }
                 break;
               }
 
               // Small delay before retrying next prompt
-              if (i < PROMPTS.length - 1) {
+              if (i < AUTO_GENERATE_COUNT - 1) {
                 console.log('  ⏳ Waiting 5s before next prompt...');
                 await sleep(5000);
               }
             }
+          }
+
+          // ─── SHUTDOWN ─────────────────────────────────────────────────────────────
+          if (geminiBrowser) {
+            console.log('🌐 Closing Gemini Shared Browser...');
+            await geminiBrowser.close().catch(() => {});
           }
 
           // ─── SUMMARY ──────────────────────────────────────────────────────────────
@@ -875,9 +1052,9 @@ jobs:
           console.log('\n============================================================');
           console.log('  🏁  GENERATION COMPLETE');
           console.log('============================================================');
-          console.log(`✅ Success : ${successCount}/${PROMPTS.length}`);
-          console.log(`❌ Failed  : ${failedCount}/${PROMPTS.length}`);
-          console.log(`⏭️  Skipped : ${skippedCount}/${PROMPTS.length}`);
+          console.log(`✅ Success : ${successCount}/${AUTO_GENERATE_COUNT}`);
+          console.log(`❌ Failed  : ${failedCount}/${AUTO_GENERATE_COUNT}`);
+          console.log(`⏭️  Skipped : ${skippedCount}/${AUTO_GENERATE_COUNT}`);
           console.log('');
           console.log('📋 Results:');
           results.forEach((r, i) => {
@@ -891,7 +1068,7 @@ jobs:
           });
           console.log('============================================================');
 
-          if (failedCount === PROMPTS.length) {
+          if (failedCount === AUTO_GENERATE_COUNT) {
             process.exit(1);
           }
           SCRIPT_EOF
