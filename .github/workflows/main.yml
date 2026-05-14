@@ -399,7 +399,7 @@ jobs:
                 document.querySelectorAll('div.ds-markdown').length
               );
 
-              const inputSel = 'textarea#chat-input';
+              const inputSel = 'textarea';
               await page.waitForSelector(inputSel, { timeout: 15000 });
               await page.click(inputSel);
               await page.keyboard.press('Control+a');
