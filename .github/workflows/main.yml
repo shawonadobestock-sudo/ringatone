@@ -507,12 +507,11 @@ jobs:
             const randomSalt = Math.random().toString(36).substring(7);
 
             const ENHANCE_PROMPT = prompt 
-              ? `I want to generate a stunning mobile wallpaper based on this idea: "${prompt}".\n` +
-                `Rewrite this into an ultra-detailed, highly aesthetic visual prompt for a state-of-the-art AI image generator (like Midjourney or Imagen 3). Focus on breathtaking composition, dramatic lighting, and intricate textures. Specify vertical portrait orientation. [Salt: ${randomSalt}]`
-              : `You are an expert art director. Generate a unique visual prompt (max 40 words) for a breathtaking mobile wallpaper.\n\n` +
-                `Choose a random aesthetic theme (e.g., Cyberpunk, Ethereal Fantasy, Hyper-detailed Nature Macro, Space Nebula, Minimalist Architectural Glassmorphism, Bio-luminescent Deep Sea, Cinematic Neo-Noir, Vibrant Pop Art).\n` +
-                `CRITICAL: Focus on photorealistic lighting, 8k resolution details, octane render aesthetics. Specify vertical portrait orientation. [Random Salt: ${randomSalt}]\n` +
-                `Return ONLY the generated prompt, nothing else.`;
+              ? `You are an AI prompt engineer. I have a wallpaper concept: "${prompt}".\n` +
+                `Write a detailed 30-word visual prompt describing this scene for Midjourney/Imagen 3. Focus on lighting and textures. CRITICAL: Do NOT generate an image. Return ONLY the text prompt. [Salt: ${randomSalt}]`
+              : `You are an AI prompt engineer. Write a unique 30-word visual prompt describing a breathtaking mobile wallpaper scene for Midjourney/Imagen 3.\n\n` +
+                `Choose a random aesthetic theme (Cyberpunk, Sci-Fi Nebula, Bioluminescent Deep Sea, Minimalist Glassmorphism, Ethereal Fantasy, Macro Nature).\n` +
+                `CRITICAL: Do NOT generate an image. Return ONLY the raw text prompt, nothing else. [Salt: ${randomSalt}]`;
 
             const TITLE_PROMPT = `Based on the wallpaper you just described, generate a creative and UNIQUE title (max 25 characters).\n` +
               `Return ONLY the title, no quotes.`;
@@ -1018,11 +1017,11 @@ jobs:
                 try { if (await page.isVisible(sel)) { await page.click(sel); await sleep(1000); } } catch {}
               }
 
-              // Setup response interceptor before clicking generate
+              // Setup response interceptor before clicking generate (non-blocking catch)
               const imagePromise = page.waitForResponse(resp => 
                 resp.url().includes('flowMedia:batchGenerateImages') && resp.status() === 200,
-                { timeout: 90000 }
-              );
+                { timeout: 60000 }
+              ).catch(() => null);
 
               // Enter prompt into editor
               const editorSels = ['div[contenteditable="true"]', 'textarea[placeholder*="prompt" i]', 'textarea'];
@@ -1034,13 +1033,15 @@ jobs:
                     await page.keyboard.press('Control+a');
                     await page.keyboard.press('Delete');
                     await page.keyboard.insertText(promptText);
+                    await sleep(300);
+                    await page.keyboard.type(' '); // trigger React change handlers
                     clicked = true;
                     break;
                   }
                 } catch {}
               }
               if (!clicked) throw new Error('Could not find ImageFX prompt editor input.');
-              await sleep(1000);
+              await sleep(1500);
 
               // Click generate
               const generateBtnSels = ['button:has-text("Generate")', 'button:has-text("Create")'];
@@ -1059,11 +1060,33 @@ jobs:
               }
 
               console.log('  ⏳ Waiting for Imagen 3 batchGenerateImages response...');
+              let fifeUrl = null;
               const response = await imagePromise;
-              const data = await response.json();
+              if (response) {
+                try {
+                  const data = await response.json();
+                  fifeUrl = data?.media?.[0]?.image?.generatedImage?.fifeUrl;
+                } catch {}
+              }
 
-              const fifeUrl = data?.media?.[0]?.image?.generatedImage?.fifeUrl;
-              if (!fifeUrl) throw new Error('CDN fifeUrl not found in ImageFX response JSON.');
+              if (!fifeUrl) {
+                console.log('  ⚠️ Network interceptor timeout/fallback. Polling DOM gallery for generated images...');
+                for (let i = 0; i < 30; i++) {
+                  await sleep(2000);
+                  const imgs = await page.evaluate(() => {
+                    return Array.from(document.querySelectorAll('img'))
+                      .map(img => img.src)
+                      .filter(src => src.includes('flow-content.google/image'));
+                  });
+                  if (imgs.length > 0) {
+                    fifeUrl = imgs[imgs.length - 1]; // pick latest generated image
+                    console.log('  ✅ Captured generated image URL from DOM gallery!');
+                    break;
+                  }
+                }
+              }
+
+              if (!fifeUrl) throw new Error('Timed out waiting for ImageFX generation. CDN fifeUrl not found.');
 
               console.log(`  ✅ Wallpaper generated! CDN URL: ${fifeUrl.slice(0, 80)}...`);
 
