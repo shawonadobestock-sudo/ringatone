@@ -1009,12 +1009,20 @@ jobs:
             
             try {
               await page.goto('https://labs.google/fx/tools/image-fx', { waitUntil: 'domcontentloaded', timeout: 45000 });
-              await sleep(4000);
+              await sleep(5000);
 
-              // Dismiss potential overlays
-              const dismissBtns = ['button:has-text("Got it")', 'button:has-text("Agree")', 'button:has-text("Dismiss")', 'button:has-text("Close")'];
-              for (const sel of dismissBtns) {
-                try { if (await page.isVisible(sel)) { await page.click(sel); await sleep(1000); } } catch {}
+              // Actively dismiss any welcome banners, onboarding modals, or terms popups across multiple attempts
+              const dismissBtns = [
+                'button:has-text("Got it")', 'button:has-text("Agree")', 'button:has-text("I agree")',
+                'button:has-text("Accept")', 'button:has-text("Dismiss")', 'button:has-text("Close")',
+                'button:has-text("Continue")', 'button:has-text("Get started")', 'button:has-text("Try ImageFX")',
+                'button:has-text("Next")'
+              ];
+              for (let d = 0; d < 3; d++) {
+                for (const sel of dismissBtns) {
+                  try { if (await page.isVisible(sel)) { await page.click(sel); await sleep(1000); } } catch {}
+                }
+                await sleep(1000);
               }
 
               // Setup response interceptor before clicking generate (non-blocking catch)
@@ -1023,24 +1031,53 @@ jobs:
                 { timeout: 60000 }
               ).catch(() => null);
 
-              // Enter prompt into editor
-              const editorSels = ['div[contenteditable="true"]', 'textarea[placeholder*="prompt" i]', 'textarea'];
+              // Editor selectors covering all possible Google Labs rich text inputs
+              const editorSels = [
+                'div[contenteditable="true"]',
+                '[role="textbox"]',
+                'textarea[placeholder*="prompt" i]',
+                'textarea[aria-label*="prompt" i]',
+                'textarea',
+                'input[placeholder*="prompt" i]',
+                'input[type="text"]'
+              ];
+
               let clicked = false;
-              for (const sel of editorSels) {
-                try {
-                  if (await page.isVisible(sel)) {
-                    await page.click(sel);
-                    await page.keyboard.press('Control+a');
-                    await page.keyboard.press('Delete');
-                    await page.keyboard.insertText(promptText);
-                    await sleep(300);
-                    await page.keyboard.type(' '); // trigger React change handlers
-                    clicked = true;
-                    break;
-                  }
-                } catch {}
+              for (let attempts = 0; attempts < 5; attempts++) {
+                for (const sel of editorSels) {
+                  try {
+                    if (await page.isVisible(sel)) {
+                      await page.click(sel);
+                      await page.keyboard.press('Control+a');
+                      await page.keyboard.press('Delete');
+                      await page.keyboard.insertText(promptText);
+                      await sleep(500);
+                      await page.keyboard.type(' '); // trigger React change handlers
+                      clicked = true;
+                      break;
+                    }
+                  } catch {}
+                }
+                if (clicked) break;
+                await sleep(2000);
               }
-              if (!clicked) throw new Error('Could not find ImageFX prompt editor input.');
+
+              if (!clicked) {
+                // Log complete DOM debug info to console so we can see exactly what's on screen in GitHub Actions
+                const debugInfo = await page.evaluate(() => {
+                  const btns = Array.from(document.querySelectorAll('button')).map(b => b.innerText.trim()).filter(Boolean);
+                  const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')).map(el => ({
+                    tag: el.tagName,
+                    type: el.type || '',
+                    placeholder: el.placeholder || el.getAttribute('aria-label') || '',
+                    className: el.className
+                  }));
+                  return { btns, inputs };
+                });
+                console.log(`  🔍 [DEBUG DOM] Visible Buttons: ${JSON.stringify(debugInfo.btns)}`);
+                console.log(`  🔍 [DEBUG DOM] Inputs/Editors: ${JSON.stringify(debugInfo.inputs)}`);
+                throw new Error('Could not find ImageFX prompt editor input. (See DOM debug info above)');
+              }
               await sleep(1500);
 
               // Click generate
