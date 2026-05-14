@@ -48,6 +48,20 @@ on:
           - zedge_3
           - all_three
 
+      ai_provider:
+        description: "🧠 AI Provider for Metadata & Prompts"
+        required: true
+        default: "deepseek"
+        type: choice
+        options:
+          - deepseek
+          - gemini
+
+      deepseek_api_token:
+        description: "🔑 DeepSeek API Token (required if using DeepSeek)"
+        required: false
+        default: ""
+
       gemini_session:
         description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
         required: false
@@ -83,6 +97,9 @@ jobs:
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
+          DEEPSEEK_API_TOKEN: ${{ secrets.DEEPSEEK_API_TOKEN }}
+          DEEPSEEK_API_TOKEN_INPUT: ${{ github.event.inputs.deepseek_api_token }}
+          AI_PROVIDER: ${{ github.event.inputs.ai_provider }}
           AUTO_GENERATE_COUNT: ${{ github.event.inputs.auto_generate_count }}
           TARGET_ACCOUNT: ${{ github.event.inputs.target_account }}
           LENGTH_SECONDS: ${{ github.event.inputs.length_seconds }}
@@ -100,6 +117,8 @@ jobs:
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
+          const AI_PROVIDER          = (process.env.AI_PROVIDER || 'deepseek').trim().toLowerCase();
+          const DEEPSEEK_TOKEN       = (process.env.DEEPSEEK_API_TOKEN_INPUT?.trim() || process.env.DEEPSEEK_API_TOKEN || '').trim();
           const GEMINI_SESSION_RAW   = (process.env.GEMINI_SESSION_INPUT?.trim() || process.env.GEMINI_SESSION || '').trim();
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
           const QUEUE_PATH           = 'wallpaperQueue';
@@ -110,22 +129,33 @@ jobs:
           const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
           const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
 
-          // Parse Gemini session
-          if (!GEMINI_SESSION_RAW) {
-            console.error('❌ Error: GEMINI_SESSION secret or input is missing. Direct Gemini Web Session is required.');
-            process.exit(1);
-          }
+          // Parse AI Provider configuration
           let GEMINI_STORAGE_STATE = null;
-          try {
-            GEMINI_STORAGE_STATE = JSON.parse(GEMINI_SESSION_RAW);
-            console.log('🌐 Gemini Web Session loaded successfully (no API key needed!)');
-          } catch (e) {
-            console.error('❌ Error: GEMINI_SESSION is not valid JSON. Please check your storageState JSON export.');
-            process.exit(1);
+          if (AI_PROVIDER === 'gemini') {
+            if (!GEMINI_SESSION_RAW) {
+              console.error('❌ Error: GEMINI_SESSION secret or input is missing. Direct Gemini Web Session is required.');
+              process.exit(1);
+            }
+            try {
+              GEMINI_STORAGE_STATE = JSON.parse(GEMINI_SESSION_RAW);
+              console.log('🌐 Gemini Web Session loaded successfully (no API key needed!)');
+            } catch (e) {
+              console.error('❌ Error: GEMINI_SESSION is not valid JSON. Please check your storageState JSON export.');
+              process.exit(1);
+            }
+          } else {
+            if (!DEEPSEEK_TOKEN) {
+              console.error('❌ Error: DEEPSEEK_API_TOKEN secret or input is missing. Required for DeepSeek AI provider.');
+              process.exit(1);
+            }
+            console.log('🧠 DeepSeek Token configured successfully!');
           }
 
           let geminiBrowser = null;
           let geminiPage = null;
+          let deepseekBrowser = null;
+          let deepseekPage = null;
+          let isDeepSeekRest = AI_PROVIDER === 'deepseek' && DEEPSEEK_TOKEN.startsWith('sk-');
 
           async function initGemini() {
             console.log('🌐 Starting Gemini Shared Browser...');
@@ -217,7 +247,14 @@ jobs:
           console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
           TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
           console.log(`📂 Queue Path: ${QUEUE_PATH}`);
-          console.log(`🌐 Gemini Mode : Web scraping (gemini.google.com) — direct session!`);
+          console.log(`🧠 AI Provider: ${AI_PROVIDER.toUpperCase()}`);
+          if (AI_PROVIDER === 'gemini') {
+            console.log(`🌐 Gemini Mode : Web scraping (gemini.google.com) — direct session!`);
+          } else if (isDeepSeekRest) {
+            console.log(`🔑 DeepSeek Mode: Direct REST API (api.deepseek.com)`);
+          } else {
+            console.log(`🌐 DeepSeek Mode: Web token automation (chat.deepseek.com)`);
+          }
           console.log('============================================================\n');
 
           // ─── GEMINI VIA WEB SCRAPING (uses saved Google session) ───────────────────
@@ -303,6 +340,156 @@ jobs:
               responses.push(responseText);
               await sleep(1000); // Brief pause between sequential prompts
             }
+            return responses;
+          }
+
+          // ─── DEEPSEEK VIA WEB TOKEN SCRAPING (chat.deepseek.com) ───────────────────
+          async function initDeepSeekWeb() {
+            console.log('🌐 Starting DeepSeek Shared Browser...');
+            const { chromium } = await import('playwright-extra');
+            const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+            chromium.use(StealthPlugin());
+
+            deepseekBrowser = await chromium.launch({
+              headless: false,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+                     '--disable-blink-features=AutomationControlled']
+            });
+
+            const context = await deepseekBrowser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+              viewport: { width: 1280, height: 800 }
+            });
+
+            deepseekPage = await context.newPage();
+            console.log('🌐 Loading chat.deepseek.com ...');
+            await deepseekPage.goto('https://chat.deepseek.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(2000);
+
+            console.log('🔑 Injecting userToken into localStorage...');
+            await deepseekPage.evaluate((token) => {
+              localStorage.setItem('userToken', JSON.stringify({ value: token, _version: '0' }));
+            }, DEEPSEEK_TOKEN);
+
+            await deepseekPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(3000);
+
+            // Dismiss any potential introductory overlays
+            const dismissSels = ['button:has-text("Got it")', 'button:has-text("OK")', 'button:has-text("Close")'];
+            for (const sel of dismissSels) {
+              try {
+                if (await deepseekPage.isVisible(sel)) {
+                  await deepseekPage.click(sel);
+                  await sleep(1000);
+                }
+              } catch (e) {}
+            }
+
+            console.log('✅ DeepSeek web session active and initialized!');
+          }
+
+          async function callDeepSeekWeb(promptTexts, page) {
+            const responses = [];
+
+            for (let i = 0; i < promptTexts.length; i++) {
+              const prompt = promptTexts[i];
+              console.log(`    🌐 [DeepSeek Web ${i+1}/${promptTexts.length}] Sending prompt...`);
+
+              const prevDoneCount = await page.evaluate(() =>
+                document.querySelectorAll('div.ds-markdown').length
+              );
+
+              const inputSel = 'textarea#chat-input';
+              await page.waitForSelector(inputSel, { timeout: 15000 });
+              await page.click(inputSel);
+              await page.keyboard.press('Control+a');
+              await page.keyboard.press('Delete');
+              await sleep(150);
+
+              await page.keyboard.insertText(prompt);
+              await sleep(300);
+              await page.keyboard.press('Enter');
+
+              const deadline = Date.now() + 90000;
+              let responseText = '';
+              let stableConsecutive = 0;
+              let lastLen = 0;
+
+              while (Date.now() < deadline) {
+                await sleep(2000);
+
+                const currentDivs = await page.evaluate(() => {
+                  const divs = Array.from(document.querySelectorAll('div.ds-markdown'));
+                  return divs.map(d => d.innerText.trim());
+                });
+
+                if (currentDivs.length > prevDoneCount) {
+                  const latestText = currentDivs[currentDivs.length - 1];
+                  if (latestText.length > 0 && latestText.length === lastLen) {
+                    stableConsecutive++;
+                    if (stableConsecutive >= 2) {
+                      responseText = latestText;
+                      break;
+                    }
+                  } else {
+                    stableConsecutive = 0;
+                    lastLen = latestText.length;
+                  }
+                }
+              }
+
+              if (!responseText) {
+                throw new Error(`DeepSeek web timeout: no response for prompt ${i+1}`);
+              }
+
+              console.log(`    ✅ [DeepSeek Web ${i+1}] Got response (${responseText.length} chars)`);
+              responses.push(responseText);
+              await sleep(1000);
+            }
+
+            return responses;
+          }
+
+          // ─── DEEPSEEK API CHAT COMPLETION SEQUENCE ─────────────────────────────────
+          async function callDeepSeekChat(messages) {
+            const res = await fetch('https://api.deepseek.com/chat/completions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${DEEPSEEK_TOKEN}`
+              },
+              body: JSON.stringify({
+                model: 'deepseek-chat',
+                messages: messages,
+                temperature: 0.7
+              })
+            });
+
+            if (!res.ok) {
+              const err = await res.text();
+              throw new Error(`DeepSeek API error (${res.status}): ${err}`);
+            }
+
+            const data = await res.json();
+            return data.choices[0].message.content.trim();
+          }
+
+          async function callDeepSeekSequence(promptTexts) {
+            const responses = [];
+            const messages = [];
+
+            for (let i = 0; i < promptTexts.length; i++) {
+              console.log(`    🧠 [DeepSeek ${i+1}/${promptTexts.length}] Sending prompt...`);
+              messages.push({ role: 'user', content: promptTexts[i] });
+
+              const reply = await callDeepSeekChat(messages);
+              console.log(`    ✅ [DeepSeek ${i+1}] Got response (${reply.length} chars)`);
+
+              messages.push({ role: 'assistant', content: reply });
+              responses.push(reply);
+              await sleep(500);
+            }
+
             return responses;
           }
 
@@ -458,20 +645,42 @@ jobs:
               `No punctuation, no sentences. Capture the soul of the sound.\n` +
               `Return ONLY the description.`;
 
-            if (!geminiPage) {
-              throw new Error('Gemini page is not initialized!');
+            let r0, r1, r2, r3, r4;
+            if (AI_PROVIDER === 'gemini') {
+              if (!geminiPage) {
+                throw new Error('Gemini page is not initialized!');
+              }
+
+              // Reset to a fresh chat for every new metadata prompt sequence
+              console.log('  🌐 Resetting to a fresh Gemini chat...');
+              await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await sleep(2000);
+
+              // Send all 5 prompts sequentially in ONE chat session
+              ([r0, r1, r2, r3, r4] = await callGeminiWeb(
+                [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+                geminiPage
+              ));
+            } else if (isDeepSeekRest) {
+              // Call DeepSeek REST API
+              ([r0, r1, r2, r3, r4] = await callDeepSeekSequence([
+                ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT
+              ]));
+            } else {
+              // Call DeepSeek Web Scraping
+              if (!deepseekPage) {
+                throw new Error('DeepSeek web page is not initialized!');
+              }
+
+              console.log('  🌐 Resetting to a fresh DeepSeek chat...');
+              await deepseekPage.goto('https://chat.deepseek.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await sleep(2000);
+
+              ([r0, r1, r2, r3, r4] = await callDeepSeekWeb(
+                [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
+                deepseekPage
+              ));
             }
-
-            // Reset to a fresh chat for every new metadata prompt sequence
-            console.log('  🌐 Resetting to a fresh Gemini chat...');
-            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await sleep(2000);
-
-            // Send all 5 prompts sequentially in ONE chat session
-            const [r0, r1, r2, r3, r4] = await callGeminiWeb(
-              [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
-              geminiPage
-            );
 
             const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim() || prompt;
             const finalTitle = cleanTitle(r1);
@@ -1046,12 +1255,21 @@ jobs:
             console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           }
 
-          // Initialize Gemini Shared Browser
-          try {
-            await initGemini();
-          } catch (geminiErr) {
-            console.error(`❌ Failed to initialize Gemini browser: ${geminiErr.message}`);
-            process.exit(1);
+          // Initialize AI Provider
+          if (AI_PROVIDER === 'gemini') {
+            try {
+              await initGemini();
+            } catch (geminiErr) {
+              console.error(`❌ Failed to initialize Gemini browser: ${geminiErr.message}`);
+              process.exit(1);
+            }
+          } else if (!isDeepSeekRest) {
+            try {
+              await initDeepSeekWeb();
+            } catch (dsErr) {
+              console.error(`❌ Failed to initialize DeepSeek browser: ${dsErr.message}`);
+              process.exit(1);
+            }
           }
 
           // ─── MAIN LOOP ─────────────────────────────────────────────────────────────
@@ -1097,6 +1315,10 @@ jobs:
             console.log('🌐 Closing Gemini Shared Browser...');
             await geminiBrowser.close().catch(() => {});
           }
+          if (deepseekBrowser) {
+            console.log('🌐 Closing DeepSeek Shared Browser...');
+            await deepseekBrowser.close().catch(() => {});
+          }
 
           // ─── SUMMARY ──────────────────────────────────────────────────────────────
           const skippedCount = results.filter(r => r.status === 'skipped').length;
@@ -1132,6 +1354,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| AI Provider | ${{ github.event.inputs.ai_provider }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Prompts | See workflow input |" >> $GITHUB_STEP_SUMMARY
           echo "| Duration | ${{ github.event.inputs.length_seconds }}s per ringtone |" >> $GITHUB_STEP_SUMMARY
           echo "| Auto-process | ${{ github.event.inputs.auto_process }} |" >> $GITHUB_STEP_SUMMARY
