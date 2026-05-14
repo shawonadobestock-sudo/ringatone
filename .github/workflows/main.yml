@@ -48,6 +48,16 @@ on:
           - zedge_3
           - all_three
 
+      generate_wallpaper:
+        description: "🖼️ Auto-generate wallpaper (ImageFX) with ringtone"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+
       gemini_session:
         description: "🌐 Gemini Web Session JSON (paste storageState JSON — no API key needed!)"
         required: false
@@ -90,6 +100,7 @@ jobs:
           VOLUME_BOOST_PCT: ${{ github.event.inputs.volume_boost_pct }}
           SILENCE_THRESHOLD: ${{ github.event.inputs.silence_threshold }}
           PAD_MS: ${{ github.event.inputs.pad_ms }}
+          GENERATE_WALLPAPER: ${{ github.event.inputs.generate_wallpaper }}
         run: |
           cat > generator.mjs << 'SCRIPT_EOF'
           import fetch from 'node-fetch';
@@ -109,6 +120,7 @@ jobs:
           const VOLUME_BOOST         = (parseInt(process.env.VOLUME_BOOST_PCT || '200', 10)) / 100;
           const SILENCE_THRESHOLD    = parseFloat(process.env.SILENCE_THRESHOLD || '0.02');
           const PAD_SEC              = (parseInt(process.env.PAD_MS || '100', 10)) / 1000;
+          const GENERATE_WALLPAPER   = process.env.GENERATE_WALLPAPER === 'true';
 
           // Parse Gemini session
           if (!GEMINI_SESSION_RAW) {
@@ -214,11 +226,128 @@ jobs:
             console.log(`🔇 Silence Threshold: ${SILENCE_THRESHOLD}`);
             console.log(`⏩ Pad: ${Math.round(PAD_SEC * 1000)}ms`);
           }
+          console.log(`🖼️  Generate Wallpaper: ${GENERATE_WALLPAPER ? 'Yes' : 'No'}`);
           console.log(`🎯 Target: ${TARGET_ACCOUNT} → ${TARGET_DB_URLS.map(d => d.name).join(' + ')}`);
           TARGET_DB_URLS.forEach(d => console.log(`   🔥 ${d.name}: ${d.url}`));
           console.log(`📂 Queue Path: ${QUEUE_PATH}`);
           console.log(`🌐 Gemini Mode : Web scraping (gemini.google.com) — direct session!`);
           console.log('============================================================\n');
+
+          // ─── GOOGLE LABS FLOW (IMAGEFX) WALLPAPER GENERATION ───────────────────────
+          let flowPage = null;
+          async function getFlowPage() {
+            if (!flowPage) {
+              console.log('🌐 Loading labs.google/fx/tools/flow ...');
+              const context = geminiBrowser.contexts()[0];
+              flowPage = await context.newPage();
+              await flowPage.goto('https://labs.google/fx/tools/flow', { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await sleep(3000);
+            }
+            return flowPage;
+          }
+
+          async function generateWallpaperWeb(prompt) {
+            console.log(`  🖼️ Generating wallpaper on Google Labs Flow...`);
+            const page = await getFlowPage();
+
+            await page.goto('https://labs.google/fx/tools/flow', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(3000);
+
+            const agreeBtns = [
+              'button:has-text("I agree")',
+              'button:has-text("Agree")',
+              'button:has-text("Got it")',
+              'button:has-text("Dismiss")'
+            ];
+            for (const sel of agreeBtns) {
+              try { if (await page.isVisible(sel)) await page.click(sel); } catch(e){}
+            }
+
+            const newProjectBtn = 'button:has-text("New project")';
+            try { if (await page.isVisible(newProjectBtn)) await page.click(newProjectBtn); } catch(e){}
+            await sleep(2000);
+
+            await page.evaluate(() => {
+              const btns = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'));
+              const target = btns.find(b => b.textContent.includes('Banana') || b.textContent.includes('x4') || b.querySelector('i')?.textContent.includes('crop_'));
+              if (target) target.click();
+            });
+            await sleep(1000);
+            
+            try { 
+              await page.evaluate(() => {
+                const tabs = Array.from(document.querySelectorAll('button[role="tab"]'));
+                const portrait = tabs.find(t => t.textContent.includes('9:16'));
+                if (portrait) portrait.click();
+              });
+            } catch(e){}
+            
+            try {
+              await page.evaluate(() => {
+                const tabs = Array.from(document.querySelectorAll('button[role="tab"]'));
+                const oneX = tabs.find(t => t.textContent.trim() === '1x');
+                if (oneX) oneX.click();
+              });
+            } catch(e){}
+            
+            await page.keyboard.press('Escape');
+            await sleep(500);
+
+            const inputSel = 'div[role="textbox"][data-slate-editor="true"]';
+            await page.waitForSelector(inputSel, { timeout: 15000 });
+            await page.click(inputSel);
+            await page.keyboard.press('Control+a');
+            await page.keyboard.press('Delete');
+            await sleep(150);
+            await page.keyboard.insertText(prompt);
+            await sleep(500);
+
+            await page.evaluate(() => {
+               const btns = Array.from(document.querySelectorAll('button'));
+               const create = btns.find(b => {
+                 const span = b.querySelector('span');
+                 return (span && span.textContent === 'Create') || b.textContent.trim() === 'Create';
+               });
+               if (create) create.click();
+            });
+
+            console.log(`  ⏳ Waiting for wallpaper generation...`);
+            
+            const deadline = Date.now() + 120000;
+            let imgSrc = null;
+            while(Date.now() < deadline) {
+              imgSrc = await page.evaluate(() => {
+                const imgs = Array.from(document.querySelectorAll('img[alt="Generated image"]'));
+                if (imgs.length > 0) {
+                  return imgs[imgs.length - 1].getAttribute('src');
+                }
+                return null;
+              });
+              if (imgSrc) break;
+              await sleep(2000);
+            }
+
+            if (!imgSrc) {
+              throw new Error("Wallpaper generation timed out or failed.");
+            }
+            
+            const fullUrl = imgSrc.startsWith('http') ? imgSrc : `https://labs.google${imgSrc}`;
+            console.log(`  ✅ Wallpaper generated: ${fullUrl}`);
+
+            const base64Data = await page.evaluate(async (url) => {
+              const response = await fetch(url);
+              const blob = await response.blob();
+              return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+              });
+            }, fullUrl);
+
+            return base64Data;
+          }
+
 
           // ─── GEMINI VIA WEB SCRAPING (uses saved Google session) ───────────────────
           // Uses confirmed DOM selectors from live gemini.google.com HTML:
@@ -971,10 +1100,22 @@ jobs:
               }
             }
 
+            // Step C.5: Optional Wallpaper Generation
+            let wallpaperBase64 = null;
+            if (GENERATE_WALLPAPER) {
+               try {
+                 const imagePrompt = `${meta.title}, ${meta.tags}, highly detailed, 4k resolution, beautiful composition`;
+                 wallpaperBase64 = await generateWallpaperWeb(imagePrompt);
+               } catch (e) {
+                 console.warn(`  ⚠️ [${dbTarget.name}] Wallpaper generation failed: ${e.message}`);
+               }
+            }
+
             // Step D: Push to this specific DB only
             const fileBase64 = `data:audio/mpeg;base64,${audioBuffer.toString('base64')}`;
             const fileName = generateFilename(meta.title);
-            const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
+            
+            const payload = {
               name: fileName,
               type: 'audio/mpeg',
               size: audioBuffer.length,
@@ -989,7 +1130,14 @@ jobs:
               status: 'queued',
               prompt,
               createdAt: Date.now()
-            });
+            };
+            
+            if (wallpaperBase64) {
+              payload.wallpaperBase64 = wallpaperBase64;
+              payload.hasWallpaper = true;
+            }
+
+            const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, payload);
             console.log(`  ✅ [${dbTarget.name}] key: ${key}  🎵 "${meta.title}" → ${(audioBuffer.length / 1024).toFixed(0)}KB`);
             return { dbName: dbTarget.name, key, title: meta.title, category: meta.category };
           }
@@ -1137,5 +1285,6 @@ jobs:
           echo "| Auto-process | ${{ github.event.inputs.auto_process }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Volume Boost | ${{ github.event.inputs.volume_boost_pct }}% |" >> $GITHUB_STEP_SUMMARY
           echo "| Target Account | ${{ github.event.inputs.target_account }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generate Wallpaper | ${{ github.event.inputs.generate_wallpaper }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> Ringtones pushed to Firebase with status **queued** — Zedge bot will pick them up on next run." >> $GITHUB_STEP_SUMMARY
