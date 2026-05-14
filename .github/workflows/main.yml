@@ -3,18 +3,8 @@ name: ☁️ Bulk Ringtone Generator → Firebase
 on:
   workflow_dispatch:
     inputs:
-      generation_type:
-        description: "🎨 What do you want to generate?"
-        required: true
-        default: "ringtone"
-        type: choice
-        options:
-          - "ringtone"
-          - "wallpaper"
-          - "both"
-
       auto_generate_count:
-        description: "🤖 Auto-generate N items (0 to disable)"
+        description: "🤖 Auto-generate N ringtones (0 to disable)"
         required: true
         default: "10"
 
@@ -88,9 +78,8 @@ jobs:
           echo "DISPLAY=:99" >> $GITHUB_ENV
           echo "✅ Xvfb virtual display started on :99"
 
-      - name: 🎵 Generate Media & Push to Firebase
+      - name: 🎵 Generate Ringtones & Push to Firebase
         env:
-          GENERATION_TYPE: ${{ github.event.inputs.generation_type }}
           STABLE_AUDIO_TOKEN: ${{ secrets.STABLE_AUDIO_TOKEN }}
           GEMINI_SESSION: ${{ secrets.GEMINI_SESSION }}
           GEMINI_SESSION_INPUT: ${{ github.event.inputs.gemini_session }}
@@ -110,7 +99,6 @@ jobs:
           import { createRequire } from 'module';
 
           // ─── CONFIG ────────────────────────────────────────────────────────────────
-          const GENERATION_TYPE      = (process.env.GENERATION_TYPE || 'ringtone').trim().toLowerCase();
           const STABLE_AUDIO_TOKEN   = process.env.STABLE_AUDIO_TOKEN?.trim();
           const GEMINI_SESSION_RAW   = (process.env.GEMINI_SESSION_INPUT?.trim() || process.env.GEMINI_SESSION || '').trim();
           const TARGET_ACCOUNT       = (process.env.TARGET_ACCOUNT || 'zedge_2').trim().toLowerCase();
@@ -495,58 +483,6 @@ jobs:
 
             return {
               enhancedPrompt: enhancedPrompt,
-              title: finalTitle,
-              tags: finalTags,
-              category: finalCategory,
-              description: finalDesc
-            };
-          }
-
-          async function generateWallpaperMetadata(prompt) {
-            console.log(`  🤖 Generating enhanced wallpaper metadata...`);
-            const randomSalt = Math.random().toString(36).substring(7);
-
-            const ENHANCE_PROMPT = prompt 
-              ? `You are an AI prompt engineer. I have a wallpaper concept: "${prompt}".\n` +
-                `Write a detailed 30-word visual prompt describing this scene for Midjourney/Imagen 3. Focus on lighting and textures. CRITICAL: Do NOT generate an image. Return ONLY the text prompt. [Salt: ${randomSalt}]`
-              : `You are an AI prompt engineer. Write a unique 30-word visual prompt describing a breathtaking mobile wallpaper scene for Midjourney/Imagen 3.\n\n` +
-                `Choose a random aesthetic theme (Cyberpunk, Sci-Fi Nebula, Bioluminescent Deep Sea, Minimalist Glassmorphism, Ethereal Fantasy, Macro Nature).\n` +
-                `CRITICAL: Do NOT generate an image. Return ONLY the raw text prompt, nothing else. [Salt: ${randomSalt}]`;
-
-            const TITLE_PROMPT = `Based on the wallpaper you just described, generate a creative and UNIQUE title (max 25 characters).\n` +
-              `Return ONLY the title, no quotes.`;
-
-            const KEYWORDS_PROMPT = `Based on the wallpaper you just described, extract 15 relevant, descriptive SINGLE-WORD keywords. ` +
-              `Focus on art style, colors, mood, elements. Present in a single comma-separated line.`;
-
-            const validCategories = VALID_RT_CATS.filter(c => c !== 'OTHER').join(', ');
-            const CATEGORY_PROMPT = `Based on the wallpaper you just described, select the most appropriate category from this list: ${validCategories}\n` +
-              `Return ONLY the category name.`;
-
-            const DESC_PROMPT = `Based on the wallpaper you just described, write a SHORT description in MAXIMUM 5 WORDS.\n` +
-              `Return ONLY the description.`;
-
-            if (!geminiPage) throw new Error('Gemini page is not initialized!');
-
-            console.log('  🌐 Resetting to a fresh Gemini chat for wallpaper metadata...');
-            await geminiPage.goto('https://gemini.google.com/app/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await sleep(2000);
-
-            const [r0, r1, r2, r3, r4] = await callGeminiWeb(
-              [ENHANCE_PROMPT, TITLE_PROMPT, KEYWORDS_PROMPT, CATEGORY_PROMPT, DESC_PROMPT],
-              geminiPage
-            );
-
-            const enhancedPrompt = r0.replace(/^["']|["']$/g, '').trim() || prompt;
-            const finalTitle = cleanTitle(r1);
-            const finalTags = cleanKeywords(r2);
-            const finalCategory = cleanCategory(r3);
-            const finalDesc = cleanDescription(r4);
-
-            console.log(`  ✨ Enhanced Wallpaper Prompt: "${enhancedPrompt}"`);
-
-            return {
-              enhancedPrompt,
               title: finalTitle,
               tags: finalTags,
               category: finalCategory,
@@ -1001,185 +937,6 @@ jobs:
             return `${name}.mp3`;
           }
 
-          // ─── GOOGLE LABS IMAGEFX (WALLPAPER AUTOMATION) ──────────────────────────
-          async function generateWallpaperImage(promptText) {
-            console.log(`  🖼️ Generating wallpaper via Google Labs ImageFX...`);
-            const context = geminiPage.context();
-            const page = await context.newPage();
-            
-            try {
-              await page.goto('https://labs.google/fx/tools/image-fx', { waitUntil: 'domcontentloaded', timeout: 45000 });
-              await sleep(5000);
-
-              // Actively dismiss any welcome banners, onboarding modals, or terms popups across multiple attempts
-              const dismissBtns = [
-                'button:has-text("Got it")', 'button:has-text("Agree")', 'button:has-text("I agree")',
-                'button:has-text("Accept")', 'button:has-text("Dismiss")', 'button:has-text("Close")',
-                'button:has-text("Continue")', 'button:has-text("Get started")', 'button:has-text("Try ImageFX")',
-                'button:has-text("Next")'
-              ];
-              for (let d = 0; d < 3; d++) {
-                for (const sel of dismissBtns) {
-                  try { if (await page.isVisible(sel)) { await page.click(sel); await sleep(1000); } } catch {}
-                }
-                await sleep(1000);
-              }
-
-              // Setup response interceptor before clicking generate (non-blocking catch)
-              const imagePromise = page.waitForResponse(resp => 
-                resp.url().includes('flowMedia:batchGenerateImages') && resp.status() === 200,
-                { timeout: 60000 }
-              ).catch(() => null);
-
-              // Editor selectors covering all possible Google Labs rich text inputs
-              const editorSels = [
-                'div[contenteditable="true"]',
-                '[role="textbox"]',
-                'textarea[placeholder*="prompt" i]',
-                'textarea[aria-label*="prompt" i]',
-                'textarea',
-                'input[placeholder*="prompt" i]',
-                'input[type="text"]'
-              ];
-
-              let clicked = false;
-              for (let attempts = 0; attempts < 5; attempts++) {
-                for (const sel of editorSels) {
-                  try {
-                    if (await page.isVisible(sel)) {
-                      await page.click(sel);
-                      await page.keyboard.press('Control+a');
-                      await page.keyboard.press('Delete');
-                      await page.keyboard.insertText(promptText);
-                      await sleep(500);
-                      await page.keyboard.type(' '); // trigger React change handlers
-                      clicked = true;
-                      break;
-                    }
-                  } catch {}
-                }
-                if (clicked) break;
-                await sleep(2000);
-              }
-
-              if (!clicked) {
-                // Log complete DOM debug info to console so we can see exactly what's on screen in GitHub Actions
-                const debugInfo = await page.evaluate(() => {
-                  const btns = Array.from(document.querySelectorAll('button')).map(b => b.innerText.trim()).filter(Boolean);
-                  const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')).map(el => ({
-                    tag: el.tagName,
-                    type: el.type || '',
-                    placeholder: el.placeholder || el.getAttribute('aria-label') || '',
-                    className: el.className
-                  }));
-                  return { btns, inputs };
-                });
-                console.log(`  🔍 [DEBUG DOM] Visible Buttons: ${JSON.stringify(debugInfo.btns)}`);
-                console.log(`  🔍 [DEBUG DOM] Inputs/Editors: ${JSON.stringify(debugInfo.inputs)}`);
-                throw new Error('Could not find ImageFX prompt editor input. (See DOM debug info above)');
-              }
-              await sleep(1500);
-
-              // Click generate
-              const generateBtnSels = ['button:has-text("Generate")', 'button:has-text("Create")'];
-              let genClicked = false;
-              for (const sel of generateBtnSels) {
-                try {
-                  if (await page.isVisible(sel)) {
-                    await page.click(sel);
-                    genClicked = true;
-                    break;
-                  }
-                } catch {}
-              }
-              if (!genClicked) {
-                await page.keyboard.press('Control+Enter');
-              }
-
-              console.log('  ⏳ Waiting for Imagen 3 batchGenerateImages response...');
-              let fifeUrl = null;
-              const response = await imagePromise;
-              if (response) {
-                try {
-                  const data = await response.json();
-                  fifeUrl = data?.media?.[0]?.image?.generatedImage?.fifeUrl;
-                } catch {}
-              }
-
-              if (!fifeUrl) {
-                console.log('  ⚠️ Network interceptor timeout/fallback. Polling DOM gallery for generated images...');
-                for (let i = 0; i < 30; i++) {
-                  await sleep(2000);
-                  const imgs = await page.evaluate(() => {
-                    return Array.from(document.querySelectorAll('img'))
-                      .map(img => img.src)
-                      .filter(src => src.includes('flow-content.google/image'));
-                  });
-                  if (imgs.length > 0) {
-                    fifeUrl = imgs[imgs.length - 1]; // pick latest generated image
-                    console.log('  ✅ Captured generated image URL from DOM gallery!');
-                    break;
-                  }
-                }
-              }
-
-              if (!fifeUrl) throw new Error('Timed out waiting for ImageFX generation. CDN fifeUrl not found.');
-
-              console.log(`  ✅ Wallpaper generated! CDN URL: ${fifeUrl.slice(0, 80)}...`);
-
-              // Download image buffer
-              const imgRes = await fetch(fifeUrl);
-              if (!imgRes.ok) throw new Error(`Failed to fetch image buffer from fifeUrl: HTTP ${imgRes.status}`);
-              const imageBuffer = Buffer.from(await imgRes.arrayBuffer());
-
-              return { fifeUrl, imageBuffer };
-
-            } finally {
-              await page.close().catch(() => {});
-            }
-          }
-
-          async function generateAndPushWallpaperOne(prompt, dbTarget) {
-            let meta;
-            try {
-              meta = await generateWallpaperMetadata(prompt);
-              console.log(`  📝 [${dbTarget.name}] Wallpaper Title: "${meta.title}"`);
-            } catch (e) {
-              console.warn(`  ⚠️ [${dbTarget.name}] Wallpaper Metadata failed: ${e.message} — using fallback`);
-              meta = {
-                enhancedPrompt: prompt || 'stunning cyberpunk neon wallpaper portrait 8k',
-                title: (prompt || 'Aesthetic Wallpaper').split(' ').slice(0, 4).join(' ').slice(0, 30),
-                tags: 'wallpaper, aesthetic, 8k, portrait',
-                category: 'OTHER',
-                description: 'Aesthetic mobile wallpaper'
-              };
-            }
-
-            const { fifeUrl, imageBuffer } = await generateWallpaperImage(meta.enhancedPrompt);
-
-            const fileBase64 = `data:image/jpeg;base64,${imageBuffer.toString('base64')}`;
-            const fileName = generateFilename(meta.title).replace('.mp3', '.jpg');
-            const key = await firebasePushToUrl(dbTarget.url, QUEUE_PATH, {
-              name: fileName,
-              type: 'image/jpeg',
-              size: imageBuffer.length,
-              width: 768,
-              height: 1376,
-              isMp3: false,
-              fileBase64,
-              imageUrl: fifeUrl,
-              title: meta.title,
-              tags: meta.tags,
-              category: meta.category,
-              description: meta.description,
-              status: 'queued',
-              prompt,
-              createdAt: Date.now()
-            });
-            console.log(`  ✅ [${dbTarget.name}] Wallpaper key: ${key}  🖼️ "${meta.title}" → ${(imageBuffer.length / 1024).toFixed(0)}KB`);
-            return { dbName: dbTarget.name, key, title: meta.title, category: meta.category, isWallpaper: true };
-          }
-
           // ─── GENERATE ONE UNIQUE RINGTONE FOR A SINGLE DB ─────────────────────────
           // Used by both single-account and all_three modes.
           // Each call produces a fresh audio (new seed) + fresh metadata → unique upload.
@@ -1241,57 +998,41 @@ jobs:
           async function processPrompt(idx, prompt) {
             const num = `[${idx + 1}/${AUTO_GENERATE_COUNT}]`;
             console.log(`\n${num} ─────────────────────────────────────────────`);
-            if (prompt) console.log(`${num} Prompt: "${prompt}" [Type: ${GENERATION_TYPE}]`);
-            else console.log(`${num} Auto-Generating Media... [Type: ${GENERATION_TYPE}]`);
+            if (prompt) console.log(`${num} Prompt: "${prompt}"`);
+            else console.log(`${num} Auto-Generating Random Ringtone...`);
             console.log(`${num} ─────────────────────────────────────────────`);
 
-            const combinedKeys = [];
-            let lastTitle = 'Generated Media';
-            let lastCategory = 'OTHER';
+            if (TARGET_DB_URLS.length === 1) {
+              // ── Single account: 1 audio → 1 DB ─────────────────────────────────────
+              const result = await generateAndPushOne(prompt, TARGET_DB_URLS[0]);
+              return { keys: [result], title: result.title, category: result.category };
 
-            for (const dbTarget of TARGET_DB_URLS) {
-              const targetPrefix = TARGET_DB_URLS.length > 1 ? `\n  ➡️  [${dbTarget.name}]` : '  ➡️ ';
-
-              // 🎵 Generate Ringtone
-              if (GENERATION_TYPE === 'ringtone' || GENERATION_TYPE === 'both') {
-                console.log(`${targetPrefix} Generating unique ringtone...`);
+            } else {
+              // ── all_three: generate a UNIQUE audio per account (NOT the same file!) ──
+              // Each account gets a different seed → different sound → safe from duplicate detection
+              console.log(`  🔀 all_three mode: generating ${TARGET_DB_URLS.length} UNIQUE audios (one per account)...`);
+              const pushResults = [];
+              for (const dbTarget of TARGET_DB_URLS) {
+                console.log(`\n  ➡️  Generating unique ringtone for [${dbTarget.name}]...`);
                 try {
-                  const res = await generateAndPushOne(prompt, dbTarget);
-                  combinedKeys.push(res);
-                  lastTitle = res.title;
-                  lastCategory = res.category;
+                  const result = await generateAndPushOne(prompt, dbTarget);
+                  pushResults.push(result);
                 } catch (e) {
-                  console.error(`  ❌ [${dbTarget.name}] Ringtone Failed: ${e.message}`);
-                  if (e.message.startsWith('API_LIMIT_REACHED')) throw e; // bubble up quota errors
+                  console.error(`  ❌ [${dbTarget.name}] Failed: ${e.message}`);
+                }
+                // Small delay between accounts to avoid API burst
+                if (TARGET_DB_URLS.indexOf(dbTarget) < TARGET_DB_URLS.length - 1) {
+                  await sleep(3000);
                 }
               }
-
-              // 🖼️ Generate Wallpaper
-              if (GENERATION_TYPE === 'wallpaper' || GENERATION_TYPE === 'both') {
-                console.log(`${targetPrefix} Generating unique wallpaper...`);
-                try {
-                  const res = await generateAndPushWallpaperOne(prompt, dbTarget);
-                  combinedKeys.push(res);
-                  lastTitle = res.title;
-                  lastCategory = res.category;
-                } catch (e) {
-                  console.error(`  ❌ [${dbTarget.name}] Wallpaper Failed: ${e.message}`);
-                }
-              }
-
-              // Small delay between accounts in all_three mode
-              if (TARGET_DB_URLS.length > 1 && TARGET_DB_URLS.indexOf(dbTarget) < TARGET_DB_URLS.length - 1) {
-                await sleep(3000);
-              }
+              if (!pushResults.length) throw new Error('All account pushes failed.');
+              return { keys: pushResults, title: pushResults[0].title, category: pushResults[0].category };
             }
-
-            if (!combinedKeys.length) throw new Error('All generation attempts failed for this prompt.');
-            return { keys: combinedKeys, title: lastTitle, category: lastCategory };
           }
 
 
           // ─── STARTUP: AUTO-CREATE ACCOUNT IF NO TOKEN PROVIDED ─────────────────────
-          if ((GENERATION_TYPE === 'ringtone' || GENERATION_TYPE === 'both') && !currentToken) {
+          if (!currentToken) {
             console.log('\n⚠️  No STABLE_AUDIO_TOKEN provided — auto-creating Stable Audio account...');
             try {
               currentToken = await createStableAudioAccount();
@@ -1301,10 +1042,8 @@ jobs:
               console.error('   Cannot proceed without a valid token.');
               process.exit(1);
             }
-          } else if (GENERATION_TYPE === 'ringtone' || GENERATION_TYPE === 'both') {
-            console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           } else {
-            console.log('✅ Wallpaper-only mode selected. Skipping Stable Audio setup.');
+            console.log('✅ Using provided STABLE_AUDIO_TOKEN.');
           }
 
           // Initialize Gemini Shared Browser
